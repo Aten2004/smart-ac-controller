@@ -42,6 +42,7 @@ const PIN_KEY = 'app_pin_unlocked';
 const SYSTEM_PIN = '1234';
 const MIN_SLEEP_THRESHOLD_MINS = 15;
 
+// ฟังก์ชันคำนวณรหัส LG 28-bit ตรงตามเฟิร์มแวร์ ESP32
 const calculateLgHex = (power: boolean, mode: string, temp: number): string => {
   if (!power) return '0x88C0051';
   if (mode === 'dry') return '0x880194E';
@@ -59,10 +60,10 @@ export default function App() {
   const [loading, setLoading] = useState<boolean>(false);
   const [refreshing, setRefreshing] = useState<boolean>(false);
 
-  // สถานะแอร์: ค่าเริ่มต้นเป็น null เพื่อรอเชื่อมต่อจริงกับ Supabase (ไม่มี mock)
+  // สถานะแอร์: ซิงก์ตรงกับ Supabase (ไม่มี Mock Data)
   const [acState, setAcState] = useState<ACState | null>(null);
   
-  // สถานะเซนเซอร์: ค่าเริ่มต้นเป็น null ชัดเจน
+  // สถานะเซนเซอร์ DHT22 สดจาก Supabase
   const [sensor, setSensor] = useState<{ temperature: number | null; humidity: number | null }>({ 
     temperature: null, 
     humidity: null 
@@ -70,13 +71,16 @@ export default function App() {
   
   const [inBedDurationMins, setInBedDurationMins] = useState<number>(0);
 
-  // ประวัติจากฐานข้อมูลจริง
+  // ข้อมูลจริงจาก sensor_logs และ sleep_sessions
   const [historyLogs, setHistoryLogs] = useState<SensorLog[]>([]);
   const [sleepSessions, setSleepSessions] = useState<SleepSession[]>([]);
   const [hoveredPoint, setHoveredPoint] = useState<SensorLog | null>(null);
-  const [logRange, setLogRange] = useState<number>(60); // ค่าเริ่มต้น 60 นาที
+  const [logRange, setLogRange] = useState<number>(60); // 60 นาทีล่าสุด
 
-  // Ref สำหรับเลื่อนกราฟซ้าย-ขวา
+  // Ref สำหรับล็อกสิทธิ์คำสั่งผู้ใช้ (ป้องกันบอร์ดส่งค่าเก่ามาทับ)
+  const manualOverrideLockUntil = useRef<number>(0);
+
+  // Ref สำหรับเลื่อนกราฟแนวนอน
   const chartScrollRef = useRef<HTMLDivElement>(null);
 
   // Touch handlers สำหรับ Swipe สลับหน้าจอ
@@ -89,7 +93,7 @@ export default function App() {
     }
   }, []);
 
-  // ตัวนับเวลาการนอนสด จากเวลาจริงในระบบ
+  // ตัวนับเวลาเปิดแอร์จริงในห้อง
   useEffect(() => {
     if (!acState || !acState.power) {
       setInBedDurationMins(0);
@@ -112,32 +116,43 @@ export default function App() {
   // ดึงข้อมูลวิเคราะห์ทั้งหมดจาก Supabase
   const fetchAnalyticsData = async () => {
     setRefreshing(true);
-    const { data: logs } = await supabase
-      .from('sensor_logs')
-      .select('*')
-      .order('created_at', { ascending: false })
-      .limit(logRange);
+    try {
+      const { data: logs, error: logsErr } = await supabase
+        .from('sensor_logs')
+        .select('*')
+        .order('created_at', { ascending: false })
+        .limit(logRange);
 
-    if (logs && logs.length > 0) {
-      const chronological = [...logs].reverse();
-      setHistoryLogs(chronological);
-      const latest = logs[0];
-      setSensor({ 
-        temperature: Number(latest.temperature), 
-        humidity: Number(latest.humidity) 
-      });
+      if (!logsErr && logs && logs.length > 0) {
+        const parsedLogs: SensorLog[] = logs.map(l => ({
+          ...l,
+          temperature: Number(l.temperature),
+          humidity: Number(l.humidity)
+        }));
+        const chronological = [...parsedLogs].reverse();
+        setHistoryLogs(chronological);
+        
+        const latest = parsedLogs[0];
+        setSensor({ 
+          temperature: latest.temperature, 
+          humidity: latest.humidity 
+        });
+      }
+
+      const { data: sessions, error: sessErr } = await supabase
+        .from('sleep_sessions')
+        .select('*')
+        .order('started_at', { ascending: false })
+        .limit(10);
+
+      if (!sessErr && sessions) {
+        setSleepSessions(sessions);
+      }
+    } catch (err) {
+      console.error('Error fetching analytics:', err);
+    } finally {
+      setRefreshing(false);
     }
-
-    const { data: sessions } = await supabase
-      .from('sleep_sessions')
-      .select('*')
-      .order('started_at', { ascending: false })
-      .limit(10);
-
-    if (sessions && sessions.length > 0) {
-      setSleepSessions(sessions);
-    }
-    setRefreshing(false);
   };
 
   useEffect(() => {
@@ -151,24 +166,38 @@ export default function App() {
 
     fetchInitial();
 
-    // ฟัง Realtime การสั่งงานแอร์
+    // ฟัง Realtime การควบคุมแอร์ (พร้อม Grace Period Guard)
     const acChannel = supabase
       .channel('realtime_ac_control')
       .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'ac_control' }, (payload) => {
-        setAcState(payload.new as ACState);
+        // หากผู้ใช้เพิ่งกดปุ่มไม่เกิน 6 วินาที ให้ข้ามข้อมูลเก่าที่บอร์ดอาจเพิ่งยิงขึ้นมา
+        if (Date.now() < manualOverrideLockUntil.current) {
+          return;
+        }
+        if (payload.new && (payload.new as ACState).id === 1) {
+          setAcState(payload.new as ACState);
+        }
       })
       .subscribe();
 
-    // ฟัง Realtime ค่าเซนเซอร์ที่ ESP32 ยิงเข้ามาใหม่
+    // ฟัง Realtime ข้อมูลเซนเซอร์จาก ESP32
     const sensorChannel = supabase
       .channel('realtime_sensor_logs')
       .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'sensor_logs' }, (payload) => {
-        const newLog = payload.new as SensorLog;
+        const rawLog = payload.new as SensorLog;
+        const newLog: SensorLog = {
+          ...rawLog,
+          temperature: Number(rawLog.temperature),
+          humidity: Number(rawLog.humidity)
+        };
         setSensor({
-          temperature: Number(newLog.temperature),
-          humidity: Number(newLog.humidity)
+          temperature: newLog.temperature,
+          humidity: newLog.humidity
         });
-        setHistoryLogs((prev) => [...prev.slice(1), newLog]);
+        setHistoryLogs((prev) => {
+          const next = [...prev, newLog];
+          return next.length > logRange ? next.slice(next.length - logRange) : next;
+        });
       })
       .subscribe();
 
@@ -215,15 +244,15 @@ export default function App() {
         .gte('created_at', startTime.toISOString())
         .lte('created_at', endTime.toISOString());
 
-      let avgT = sensor.temperature || 26;
-      let avgH = sensor.humidity || 55;
+      let avgT = sensor.temperature ?? 26.0;
+      let avgH = sensor.humidity ?? 55.0;
       let dryCount = 0;
 
       if (logs && logs.length > 0) {
-        const sumT = logs.reduce((acc, curr) => acc + Number(curr.temperature), 0);
-        const sumH = logs.reduce((acc, curr) => acc + Number(curr.humidity), 0);
-        avgT = Number((sumT / logs.length).toFixed(1));
-        avgH = Number((sumH / logs.length).toFixed(1));
+        const validTemps = logs.map(l => Number(l.temperature)).filter(v => !isNaN(v));
+        const validHums = logs.map(l => Number(l.humidity)).filter(v => !isNaN(v));
+        if (validTemps.length > 0) avgT = Number((validTemps.reduce((a, b) => a + b, 0) / validTemps.length).toFixed(1));
+        if (validHums.length > 0) avgH = Number((validHums.reduce((a, b) => a + b, 0) / validHums.length).toFixed(1));
         dryCount = logs.filter(l => l.ac_mode === 'dry').length;
       }
 
@@ -237,15 +266,25 @@ export default function App() {
       };
 
       const { data } = await supabase.from('sleep_sessions').insert([newSession]).select().single();
-        if (data) {
-          setSleepSessions(prev => [data, ...prev]);
-        }
+      if (data) {
+        setSleepSessions(prev => [data, ...prev]);
+      }
     }
   };
 
+  // จัดการอัปเดตสถานะแบบ Single Source of Truth พร้อม Auto-Disarm
   const updateState = async (updates: Partial<ACState>) => {
     if (!acState) return;
     setLoading(true);
+
+    // ล็อกสิทธิ์หน้าจอไว้ 6 วินาที เพื่อไม่ให้ Realtime จากบอร์ดมาเด้งทับ
+    manualOverrideLockUntil.current = Date.now() + 6000;
+
+    // ตรวจสอบว่าเป็นการกดปุ่มสลับ Auto Guard ตรงๆ หรือเกิดจากการกดสั่งแอร์ทั่วไป
+    const isExplicitAutoToggle = updates.is_auto !== undefined && Object.keys(updates).length === 1;
+    // หากเป็นการกดสั่งแอร์ทั่วไป ให้บังคับปลด Auto Guard ทิ้ง (is_auto = false) ทันที
+    const nextAuto = isExplicitAutoToggle ? updates.is_auto! : false;
+
     const nextPower = updates.power !== undefined ? updates.power : acState.power;
     const nextMode = updates.mode !== undefined ? updates.mode : acState.mode;
     const nextTemp = updates.target_temp !== undefined ? updates.target_temp : acState.target_temp;
@@ -267,14 +306,25 @@ export default function App() {
 
     const payload: Partial<ACState> = {
       ...updates,
+      power: nextPower,
+      mode: nextMode,
+      target_temp: nextTemp,
+      is_auto: nextAuto,
       last_command_code: nextHex,
       session_started_at: sessionStartedAt,
       updated_at: new Date().toISOString()
     };
 
+    // อัปเดตหน้าจอทันที (Optimistic UI)
     setAcState((prev) => prev ? ({ ...prev, ...payload }) : null);
-    await supabase.from('ac_control').update(payload).eq('id', 1);
-    setLoading(false);
+
+    try {
+      await supabase.from('ac_control').update(payload).eq('id', 1);
+    } catch (err) {
+      console.error('Failed to update ac_control:', err);
+    } finally {
+      setLoading(false);
+    }
   };
 
   // ตรวจจับท่าทาง Swipe สลับแท็บบนหน้าจอมือถือ
@@ -290,24 +340,26 @@ export default function App() {
   const handleTouchEnd = () => {
     if (!touchStartX.current || !touchEndX.current) return;
     const distance = touchStartX.current - touchEndX.current;
-    const isSwipeLeft = distance > 70;
-    const isSwipeRight = distance < -70;
-
-    if (isSwipeLeft && currentTab === 'control') {
+    if (distance > 70 && currentTab === 'control') {
       setCurrentTab('analytics');
       fetchAnalyticsData();
-    } else if (isSwipeRight && currentTab === 'analytics') {
+    } else if (distance < -70 && currentTab === 'analytics') {
       setCurrentTab('control');
     }
   };
 
-  // คำนวณสถิติจากประวัติจริง
+  // คำนวณสถิติจากประวัติจริง ป้องกันข้อผิดพลาด NaN
   const stats = useMemo(() => {
     if (historyLogs.length === 0) {
       return { minT: null, maxT: null, avgT: null, minH: null, maxH: null, avgH: null, optimalPercent: 0, lastSeenMins: null };
     }
-    const temps = historyLogs.map(l => Number(l.temperature));
-    const hums = historyLogs.map(l => Number(l.humidity));
+    const temps = historyLogs.map(l => Number(l.temperature)).filter(v => !isNaN(v));
+    const hums = historyLogs.map(l => Number(l.humidity)).filter(v => !isNaN(v));
+
+    if (temps.length === 0 || hums.length === 0) {
+      return { minT: null, maxT: null, avgT: null, minH: null, maxH: null, avgH: null, optimalPercent: 0, lastSeenMins: null };
+    }
+
     const minT = Math.min(...temps);
     const maxT = Math.max(...temps);
     const avgT = (temps.reduce((a, b) => a + b, 0) / temps.length).toFixed(1);
@@ -326,10 +378,10 @@ export default function App() {
     return { minT, maxT, avgT, minH, maxH, avgH, optimalPercent, lastSeenMins };
   }, [historyLogs]);
 
-  // คำนวณพิกัดกราฟ SVG แบบ Dynamic Width เพื่อให้เลื่อนซ้าย-ขวาได้
+  // คำนวณพิกัดกราฟ SVG แบบ Dynamic Width
   const chartData = useMemo(() => {
     if (historyLogs.length < 2) return null;
-    const pointSpacing = 22; // ระยะห่างระหว่างแต่ละจุด (px)
+    const pointSpacing = 22;
     const paddingLeft = 35;
     const paddingRight = 35;
     const height = 200;
@@ -388,7 +440,6 @@ export default function App() {
     );
   }
 
-  // หน้าจอรอเชื่อมต่อข้อมูลจริงครั้งแรก
   if (!acState) {
     return (
       <div className="flex min-h-[100dvh] flex-col items-center justify-center bg-[#070b14] text-white font-sans gap-3">
@@ -420,7 +471,9 @@ export default function App() {
           <p className="text-[11px] font-medium text-slate-400 tracking-wide">ห้องนอน 7.7 m² • S13LCN</p>
         </div>
 
+        {/* ปุ่มสลับโหมด Auto Guard เฉพาะจุดนี้เท่านั้นที่กดเปลี่ยนค่า is_auto ตรงๆ */}
         <button 
+          disabled={loading}
           onClick={() => updateState({ is_auto: !acState.is_auto })}
           className={`flex items-center gap-1.5 px-3 py-1.5 rounded-full border text-xs font-semibold transition active:scale-95 ${
             acState.is_auto 
@@ -551,37 +604,39 @@ export default function App() {
             )}
           </div>
 
-          {/* Controls */}
+          {/* Controls พร้อมปลดล็อกปุ่ม Chill/Safe ทุกสภาวะ */}
           <div className="space-y-2.5">
             <div className="grid grid-cols-4 gap-2">
               <button
-                disabled={loading || !acState.power || isDry || acState.target_temp <= 18}
-                onClick={() => updateState({ target_temp: acState.target_temp - 1, mode: 'cool' })}
+                disabled={loading || !acState.power || acState.target_temp <= 18}
+                onClick={() => updateState({ target_temp: Math.max(18, acState.target_temp - 1), mode: 'cool' })}
                 className="py-3 rounded-2xl bg-slate-900/80 border border-slate-800 flex items-center justify-center text-slate-300 hover:text-white disabled:opacity-30 active:scale-95"
               >
                 <ChevronDown className="h-5 w-5" />
               </button>
 
+              {/* 25°C Chill: กดได้ตลอดเวลา แม้จะอยู่ในโหมด Dry อยู่ */}
               <button
-                disabled={loading || !acState.power || isDry}
+                disabled={loading || !acState.power}
                 onClick={() => updateState({ target_temp: 25, mode: 'cool' })}
                 className={`py-3 px-2 rounded-2xl border text-xs font-semibold flex flex-col items-center justify-center gap-1 transition active:scale-95 ${
                   acState.power && isCool && acState.target_temp === 25
                     ? 'bg-cyan-500 text-slate-950 border-cyan-400 shadow-[0_0_12px_rgba(6,182,212,0.3)]'
-                    : 'bg-slate-900/70 border-slate-800 text-slate-400 disabled:opacity-30'
+                    : 'bg-slate-900/70 border-slate-800 text-slate-400 hover:text-slate-200 disabled:opacity-30'
                 }`}
               >
                 <SunDim className="h-3.5 w-3.5" />
                 25°C Chill
               </button>
 
+              {/* 26°C Safe: กดได้ตลอดเวลาเพื่อรีเซ็ตกลับจุดประหยัด */}
               <button
-                disabled={loading || !acState.power || isDry}
+                disabled={loading || !acState.power}
                 onClick={() => updateState({ target_temp: 26, mode: 'cool' })}
                 className={`py-3 px-2 rounded-2xl border text-xs font-semibold flex flex-col items-center justify-center gap-1 transition active:scale-95 ${
                   acState.power && isCool && acState.target_temp === 26
                     ? 'bg-cyan-500 text-slate-950 border-cyan-400 shadow-[0_0_12px_rgba(6,182,212,0.3)]'
-                    : 'bg-slate-900/70 border-slate-800 text-slate-400 disabled:opacity-30'
+                    : 'bg-slate-900/70 border-slate-800 text-slate-400 hover:text-slate-200 disabled:opacity-30'
                 }`}
               >
                 <Sparkles className="h-3.5 w-3.5" />
@@ -589,8 +644,8 @@ export default function App() {
               </button>
 
               <button
-                disabled={loading || !acState.power || isDry || acState.target_temp >= 30}
-                onClick={() => updateState({ target_temp: acState.target_temp + 1, mode: 'cool' })}
+                disabled={loading || !acState.power || acState.target_temp >= 30}
+                onClick={() => updateState({ target_temp: Math.min(30, acState.target_temp + 1), mode: 'cool' })}
                 className="py-3 rounded-2xl bg-slate-900/80 border border-slate-800 flex items-center justify-center text-slate-300 hover:text-white disabled:opacity-30 active:scale-95"
               >
                 <ChevronUp className="h-5 w-5" />
@@ -728,7 +783,6 @@ export default function App() {
               <span className="text-[10px] text-slate-500 font-mono">เลื่อนซ้าย-ขวาเพื่อดูไทม์ไลน์ ➔</span>
             </div>
 
-            {/* Container ที่เลื่อนซ้าย-ขวาได้อิสระ */}
             <div 
               ref={chartScrollRef}
               onTouchStart={(e) => e.stopPropagation()}
@@ -785,7 +839,6 @@ export default function App() {
                     {/* จุดบนกราฟและแกนเวลา */}
                     {chartData.dots.map((d, i) => (
                       <g key={i} className="cursor-pointer" onClick={() => setHoveredPoint(d.log)}>
-                        {/* ป้ายแสดงเวลาทุกๆ 5 จุด */}
                         {i % 5 === 0 && (
                           <text
                             x={d.x}
@@ -799,12 +852,10 @@ export default function App() {
                           </text>
                         )}
 
-                        {/* สัญลักษณ์หากเป็น Dry Mode */}
                         {d.log.ac_mode === 'dry' && (
                           <circle cx={d.x} cy={d.yh} r="4.5" fill="#3b82f6" stroke="#ffffff" strokeWidth="1.5" />
                         )}
 
-                        {/* จุดอุณหภูมิ */}
                         <circle
                           cx={d.x}
                           cy={d.yt}
@@ -843,7 +894,7 @@ export default function App() {
             )}
           </div>
 
-          {/* Timeline เหตุการณ์จริง */}
+          {/* Timeline เซสชันการนอนจริง */}
           <div className="rounded-2xl bg-slate-900/80 border border-slate-800 p-3.5 backdrop-blur-xl">
             <div className="flex items-center gap-2 mb-3">
               <Clock className="h-4 w-4 text-cyan-400" />
