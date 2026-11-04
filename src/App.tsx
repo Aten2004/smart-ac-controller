@@ -14,6 +14,8 @@ interface ACState {
   fan_speed: string;
   is_auto: boolean;
   last_command_code: string;
+  session_started_at?: string | null;
+  updated_at?: string;
 }
 
 interface SensorData {
@@ -32,8 +34,19 @@ interface SleepSession {
 
 const PIN_KEY = 'app_pin_unlocked';
 const SYSTEM_PIN = '1234';
-const SESSION_START_KEY = 'ac_sleep_session_start';
-const MIN_SLEEP_THRESHOLD_MINS = 15; // เปิดเกิน 15 นาทีถือว่าเป็นการนอนจริง
+const MIN_SLEEP_THRESHOLD_MINS = 15;
+
+// ฟังก์ชันคำนวณรหัส LG 28-bit Protocol ทุกอุณหภูมิ (18°C - 30°C)
+const calculateLgHex = (power: boolean, mode: string, temp: number): string => {
+  if (!power) return '0x88C0051'; // รหัสปิดแอร์
+  if (mode === 'dry') return '0x880194E'; // รหัส Dry Mode
+
+  const clamped = Math.min(Math.max(temp, 18), 30);
+  const tempNibble = clamped - 15; // 18 -> 3, ..., 26 -> 11 (0xB), ..., 30 -> 15 (0xF)
+  const fanNibble = 4; // พัดลมเบาคงที่ (Low Fan)
+  const checksum = (8 + 8 + 0 + 0 + tempNibble + fanNibble) & 0x0F;
+  return `0x8800${tempNibble.toString(16).toUpperCase()}${fanNibble}${checksum.toString(16).toUpperCase()}`;
+};
 
 export default function App() {
   const [isAuthenticated, setIsAuthenticated] = useState<boolean>(false);
@@ -45,13 +58,13 @@ export default function App() {
     target_temp: 26,
     fan_speed: 'low',
     is_auto: true,
-    last_command_code: '0x88C0051'
+    last_command_code: '0x88C0051',
+    session_started_at: null
   });
-  const [sensor, setSensor] = useState<SensorData>({ temperature: 25.8, humidity: 56.4 });
-  const [loading, setLoading] = useState<boolean>(false);
   
-  // สถานะเกี่ยวกับการนอน
-  const [sessionStartTime, setSessionStartTime] = useState<string | null>(null);
+  // ไม่มีข้อมูล Mock เริ่มต้นที่ 0 เพื่อรอรับค่าจริงจาก DHT22
+  const [sensor, setSensor] = useState<SensorData>({ temperature: 0, humidity: 0 });
+  const [loading, setLoading] = useState<boolean>(false);
   const [inBedDurationMins, setInBedDurationMins] = useState<number>(0);
   const [lastSession, setLastSession] = useState<SleepSession | null>(null);
 
@@ -59,28 +72,25 @@ export default function App() {
     if (localStorage.getItem(PIN_KEY) === 'true') {
       setIsAuthenticated(true);
     }
-    const savedStart = localStorage.getItem(SESSION_START_KEY);
-    if (savedStart) {
-      setSessionStartTime(savedStart);
-    }
   }, []);
 
-  // ตัวนับเวลาขณะอยู่ในห้องนอน
+  // ตัวนับเวลาการนอน เชื่อมโยงผ่าน Cloud Database ซิงก์ตรงกันทุกอุปกรณ์
   useEffect(() => {
-    if (!acState.power || !sessionStartTime) {
+    const startTimeStr = acState.session_started_at || (acState.power ? acState.updated_at : null);
+    if (!acState.power || !startTimeStr) {
       setInBedDurationMins(0);
       return;
     }
 
     const updateDuration = () => {
-      const diffMs = new Date().getTime() - new Date(sessionStartTime).getTime();
-      setInBedDurationMins(Math.floor(diffMs / (1000 * 60)));
+      const diffMs = Date.now() - new Date(startTimeStr).getTime();
+      setInBedDurationMins(Math.max(0, Math.floor(diffMs / 60000)));
     };
 
     updateDuration();
-    const interval = setInterval(updateDuration, 30000); // อัปเดตทุก 30 วินาที
+    const interval = setInterval(updateDuration, 10000); // อัปเดตทุก 10 วินาที
     return () => clearInterval(interval);
-  }, [acState.power, sessionStartTime]);
+  }, [acState.power, acState.session_started_at, acState.updated_at]);
 
   useEffect(() => {
     if (!isAuthenticated) return;
@@ -97,7 +107,6 @@ export default function App() {
         .single();
       if (logs) setSensor(logs);
 
-      // ดึงสถิติการนอนรอบล่าสุด
       const { data: lastSleep } = await supabase
         .from('sleep_sessions')
         .select('*')
@@ -109,6 +118,7 @@ export default function App() {
 
     fetchData();
 
+    // ฟังการเปลี่ยนแปลงสถานะแอร์แบบ Realtime (เปิด-ปิด, อุณหภูมิ, เวลาเริ่มนอน)
     const acChannel = supabase
       .channel('realtime_ac_control')
       .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'ac_control' }, (payload) => {
@@ -116,12 +126,13 @@ export default function App() {
       })
       .subscribe();
 
+    // ฟังค่าเซนเซอร์สดจาก ESP32 เมื่อมีการ Insert แถวใหม่
     const sensorChannel = supabase
       .channel('realtime_sensor_logs')
       .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'sensor_logs' }, (payload) => {
         setSensor({
-          temperature: payload.new.temperature,
-          humidity: payload.new.humidity
+          temperature: Number(payload.new.temperature),
+          humidity: Number(payload.new.humidity)
         });
       })
       .subscribe();
@@ -143,52 +154,39 @@ export default function App() {
     }
   };
 
-  // ฟังก์ชันคำนวณและบันทึกประวัติการนอนเมื่อปิดแอร์
   const handleSleepSessionEnd = async (startTimeStr: string) => {
     const endTime = new Date();
     const startTime = new Date(startTimeStr);
-    const durationMins = Math.floor((endTime.getTime() - startTime.getTime()) / (1000 * 60));
+    const durationMins = Math.floor((endTime.getTime() - startTime.getTime()) / 60000);
 
-    // หากเปิดไม่ถึง 15 นาที ถือเป็นการทดสอบ ไม่บันทึก
-    if (durationMins < MIN_SLEEP_THRESHOLD_MINS) {
-      console.log(`[SESSION] เปิดเพียง ${durationMins} นาที (ต่ำกว่าเกณฑ์ ${MIN_SLEEP_THRESHOLD_MINS} นาที) - ข้ามการบันทึก`);
-      localStorage.removeItem(SESSION_START_KEY);
-      setSessionStartTime(null);
-      return;
+    if (durationMins >= MIN_SLEEP_THRESHOLD_MINS) {
+      const { data: logs } = await supabase
+        .from('sensor_logs')
+        .select('temperature, humidity')
+        .gte('created_at', startTime.toISOString())
+        .lte('created_at', endTime.toISOString());
+
+      let avgT = sensor.temperature;
+      let avgH = sensor.humidity;
+
+      if (logs && logs.length > 0) {
+        const sumT = logs.reduce((acc, curr) => acc + Number(curr.temperature), 0);
+        const sumH = logs.reduce((acc, curr) => acc + Number(curr.humidity), 0);
+        avgT = Number((sumT / logs.length).toFixed(1));
+        avgH = Number((sumH / logs.length).toFixed(1));
+      }
+
+      const newSession = {
+        started_at: startTime.toISOString(),
+        ended_at: endTime.toISOString(),
+        duration_minutes: durationMins,
+        avg_temp: avgT,
+        avg_humidity: avgH
+      };
+
+      const { data } = await supabase.from('sleep_sessions').insert([newSession]).select().single();
+      if (data) setLastSession(data);
     }
-
-    // ดึงค่า Log อุณหภูมิและความชื้นในช่วงเวลาที่นอน
-    const { data: logs } = await supabase
-      .from('sensor_logs')
-      .select('temperature, humidity')
-      .gte('created_at', startTime.toISOString())
-      .lte('created_at', endTime.toISOString());
-
-    let avgT = sensor.temperature;
-    let avgH = sensor.humidity;
-
-    if (logs && logs.length > 0) {
-      const sumT = logs.reduce((acc, curr) => acc + Number(curr.temperature), 0);
-      const sumH = logs.reduce((acc, curr) => acc + Number(curr.humidity), 0);
-      avgT = Number((sumT / logs.length).toFixed(1));
-      avgH = Number((sumH / logs.length).toFixed(1));
-    }
-
-    const newSession = {
-      started_at: startTime.toISOString(),
-      ended_at: endTime.toISOString(),
-      duration_minutes: durationMins,
-      avg_temp: avgT,
-      avg_humidity: avgH
-    };
-
-    const { data, error } = await supabase.from('sleep_sessions').insert([newSession]).select().single();
-    if (!error && data) {
-      setLastSession(data);
-    }
-
-    localStorage.removeItem(SESSION_START_KEY);
-    setSessionStartTime(null);
   };
 
   const updateState = async (updates: Partial<ACState>) => {
@@ -196,40 +194,32 @@ export default function App() {
     const nextPower = updates.power !== undefined ? updates.power : acState.power;
     const nextMode = updates.mode !== undefined ? updates.mode : acState.mode;
     const nextTemp = updates.target_temp !== undefined ? updates.target_temp : acState.target_temp;
+    const nextHex = calculateLgHex(nextPower, nextMode, nextTemp);
 
-    // ตรวจสอบโฟลว์การเปิด/ปิดเพื่อจัดการ Sleep Session
+    let sessionStartedAt = acState.session_started_at;
+
     if (updates.power !== undefined) {
       if (updates.power && !acState.power) {
-        // เริ่มต้นเปิดแอร์ -> บันทึกเวลาเริ่มเข้าห้องนอน
-        const nowIso = new Date().toISOString();
-        localStorage.setItem(SESSION_START_KEY, nowIso);
-        setSessionStartTime(nowIso);
+        sessionStartedAt = new Date().toISOString();
       } else if (!updates.power && acState.power) {
-        // ปิดแอร์ -> เข้ากระบวนการตรวจสอบและสรุปผลการนอน
-        const currentStart = sessionStartTime || localStorage.getItem(SESSION_START_KEY);
-        if (currentStart) {
-          await handleSleepSessionEnd(currentStart);
+        const activeStart = acState.session_started_at || acState.updated_at;
+        if (activeStart) {
+          await handleSleepSessionEnd(activeStart);
         }
+        sessionStartedAt = null;
       }
     }
 
-    let hexCode = '0x88C0051';
-    if (nextPower) {
-      if (nextMode === 'dry') {
-        hexCode = '0x880194E';
-      } else if (nextTemp === 25) {
-        hexCode = '0x8800A4E';
-      } else {
-        hexCode = '0x8800B4F';
-      }
-    }
+    const payload: Partial<ACState> = {
+      ...updates,
+      last_command_code: nextHex,
+      session_started_at: sessionStartedAt,
+      updated_at: new Date().toISOString()
+    };
 
-    const payload = { ...updates, last_command_code: hexCode };
     setAcState((prev) => ({ ...prev, ...payload }));
-
-    const { error } = await supabase.from('ac_control').update(payload).eq('id', 1);
+    await supabase.from('ac_control').update(payload).eq('id', 1);
     setLoading(false);
-    if (error) console.error(error);
   };
 
   if (!isAuthenticated) {
@@ -288,7 +278,7 @@ export default function App() {
         </button>
       </header>
 
-      {/* 2. Room Sensor Badges & Comfort Status */}
+      {/* 2. Room Sensor Badges */}
       <div className="w-full max-w-md space-y-2">
         <div className="grid grid-cols-2 gap-3">
           <div className="rounded-2xl bg-slate-900/60 border border-slate-800/80 p-3.5 flex items-center gap-3 backdrop-blur-md">
@@ -322,10 +312,11 @@ export default function App() {
           </div>
         </div>
 
-        {/* ป้ายเตือนสภาวะอากาศเพื่อผิวหนังและภูมิแพ้ */}
         <div className="flex items-center justify-between px-3 py-1.5 rounded-xl bg-slate-900/40 border border-slate-800/50 text-[11px]">
           <span className="text-slate-400">ประเมินสภาพอากาศ:</span>
-          {isOptimal ? (
+          {sensor.temperature === 0 ? (
+            <span className="text-slate-500">รอรับสัญญาณสดจาก DHT22...</span>
+          ) : isOptimal ? (
             <span className="text-emerald-400 font-semibold flex items-center gap-1">
               <CheckCircle2 className="h-3 w-3" /> สบายผิว & ทางเดินหายใจโล่ง
             </span>
@@ -341,7 +332,6 @@ export default function App() {
 
       {/* 3. Central Climate Ring & Live Session Tracker */}
       <div className="relative flex flex-col items-center justify-center my-auto py-2">
-        {/* Glowing Background Radial */}
         <div className={`absolute h-60 w-60 rounded-full blur-3xl transition-opacity duration-700 pointer-events-none ${
           !acState.power 
             ? 'bg-transparent' 
@@ -350,9 +340,7 @@ export default function App() {
               : 'bg-cyan-500/25'
         }`} />
 
-        {/* Outer Circular Track */}
         <div className="relative flex h-60 w-60 items-center justify-center rounded-full border border-slate-800/90 bg-slate-950/70 p-4 shadow-[inset_0_2px_12px_rgba(0,0,0,0.8)] backdrop-blur-2xl">
-          {/* Inner Halo Ring */}
           <div className={`flex h-full w-full flex-col items-center justify-center rounded-full border transition-all duration-500 ${
             !acState.power 
               ? 'border-slate-800/60 bg-slate-900/30 text-slate-600' 
@@ -388,7 +376,6 @@ export default function App() {
           </div>
         </div>
 
-        {/* ตัวนับเวลาการเข้านอนแบบสด (Active Sleep Timer) */}
         {acState.power && (
           <div className="mt-3 flex items-center gap-2 px-3.5 py-1.5 rounded-full bg-slate-900/80 border border-slate-800 text-xs text-slate-300">
             <Moon className="h-3.5 w-3.5 text-cyan-400" />
@@ -406,12 +393,12 @@ export default function App() {
         )}
       </div>
 
-      {/* 4. Thumb-Zone Controls & Sleep Statistics */}
+      {/* 4. Controls (ปรับอุณหภูมิอิสระ 18°C - 30°C) */}
       <div className="w-full max-w-md space-y-2.5">
-        {/* ปรับอุณหภูมิละเอียด (+ / -) และ Presets */}
         <div className="grid grid-cols-4 gap-2">
+          {/* ลดอุณหภูมิทีละ 1 องศา ลงได้สุดถึง 18°C */}
           <button
-            disabled={loading || !acState.power || isDry || acState.target_temp <= 24}
+            disabled={loading || !acState.power || isDry || acState.target_temp <= 18}
             onClick={() => updateState({ target_temp: acState.target_temp - 1, mode: 'cool' })}
             className="py-3 rounded-2xl bg-slate-900/80 border border-slate-800 flex items-center justify-center text-slate-300 hover:text-white disabled:opacity-30 active:scale-95"
           >
@@ -444,8 +431,9 @@ export default function App() {
             26°C Safe
           </button>
 
+          {/* เพิ่มอุณหภูมิทีละ 1 องศา ขึ้นได้สุดถึง 30°C */}
           <button
-            disabled={loading || !acState.power || isDry || acState.target_temp >= 28}
+            disabled={loading || !acState.power || isDry || acState.target_temp >= 30}
             onClick={() => updateState({ target_temp: acState.target_temp + 1, mode: 'cool' })}
             className="py-3 rounded-2xl bg-slate-900/80 border border-slate-800 flex items-center justify-center text-slate-300 hover:text-white disabled:opacity-30 active:scale-95"
           >
@@ -453,7 +441,6 @@ export default function App() {
           </button>
         </div>
 
-        {/* ปุ่มโหมดการทำงานและ Power หลัก */}
         <div className="grid grid-cols-3 gap-2">
           <button
             disabled={loading || !acState.power}
@@ -495,7 +482,6 @@ export default function App() {
           </button>
         </div>
 
-        {/* การ์ดสถิติการนอนรอบล่าสุด (Last Sleep Summary) */}
         {lastSession && (
           <div className="rounded-2xl bg-slate-900/50 border border-slate-800/80 p-3 flex items-center justify-between text-xs backdrop-blur-md">
             <div className="flex items-center gap-2">
@@ -519,7 +505,6 @@ export default function App() {
           </div>
         )}
 
-        {/* Hardware Status Strip */}
         <div className="rounded-xl bg-slate-950 border border-slate-900 px-3.5 py-1.5 flex items-center justify-between text-[10px] text-slate-400 font-mono">
           <div className="flex items-center gap-1.5">
             <span className="h-1.5 w-1.5 rounded-full bg-cyan-500" />
