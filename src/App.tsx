@@ -1,9 +1,11 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useMemo, useRef } from 'react';
 import { supabase } from './supabaseClient';
 import { 
   Power, Droplets, Thermometer, ShieldCheck, 
   Lock, Wind, Snowflake, SunDim, Sparkles, 
-  Moon, Clock, ChevronUp, ChevronDown, CheckCircle2
+  Moon, Clock, ChevronUp, ChevronDown, CheckCircle2,
+  LineChart as ChartIcon, Sliders, Activity, RefreshCw, 
+  ChevronLeft, ChevronRight, Loader2
 } from 'lucide-react';
 
 interface ACState {
@@ -18,12 +20,16 @@ interface ACState {
   updated_at?: string;
 }
 
-interface SensorData {
+interface SensorLog {
+  id: number;
   temperature: number;
   humidity: number;
+  ac_mode?: string;
+  created_at: string;
 }
 
 interface SleepSession {
+  id?: number;
   started_at: string;
   ended_at?: string;
   duration_minutes?: number;
@@ -36,14 +42,12 @@ const PIN_KEY = 'app_pin_unlocked';
 const SYSTEM_PIN = '1234';
 const MIN_SLEEP_THRESHOLD_MINS = 15;
 
-// ฟังก์ชันคำนวณรหัส LG 28-bit Protocol ทุกอุณหภูมิ (18°C - 30°C)
 const calculateLgHex = (power: boolean, mode: string, temp: number): string => {
-  if (!power) return '0x88C0051'; // รหัสปิดแอร์
-  if (mode === 'dry') return '0x880194E'; // รหัส Dry Mode
-
+  if (!power) return '0x88C0051';
+  if (mode === 'dry') return '0x880194E';
   const clamped = Math.min(Math.max(temp, 18), 30);
-  const tempNibble = clamped - 15; // 18 -> 3, ..., 26 -> 11 (0xB), ..., 30 -> 15 (0xF)
-  const fanNibble = 4; // พัดลมเบาคงที่ (Low Fan)
+  const tempNibble = clamped - 15;
+  const fanNibble = 4;
   const checksum = (8 + 8 + 0 + 0 + tempNibble + fanNibble) & 0x0F;
   return `0x8800${tempNibble.toString(16).toUpperCase()}${fanNibble}${checksum.toString(16).toUpperCase()}`;
 };
@@ -51,22 +55,34 @@ const calculateLgHex = (power: boolean, mode: string, temp: number): string => {
 export default function App() {
   const [isAuthenticated, setIsAuthenticated] = useState<boolean>(false);
   const [pinInput, setPinInput] = useState<string>('');
-  const [acState, setAcState] = useState<ACState>({
-    id: 1,
-    power: false,
-    mode: 'cool',
-    target_temp: 26,
-    fan_speed: 'low',
-    is_auto: true,
-    last_command_code: '0x88C0051',
-    session_started_at: null
+  const [currentTab, setCurrentTab] = useState<'control' | 'analytics'>('control');
+  const [loading, setLoading] = useState<boolean>(false);
+  const [refreshing, setRefreshing] = useState<boolean>(false);
+
+  // สถานะแอร์: ค่าเริ่มต้นเป็น null เพื่อรอเชื่อมต่อจริงกับ Supabase (ไม่มี mock)
+  const [acState, setAcState] = useState<ACState | null>(null);
+  
+  // สถานะเซนเซอร์: ค่าเริ่มต้นเป็น null ชัดเจน
+  const [sensor, setSensor] = useState<{ temperature: number | null; humidity: number | null }>({ 
+    temperature: null, 
+    humidity: null 
   });
   
-  // ไม่มีข้อมูล Mock เริ่มต้นที่ 0 เพื่อรอรับค่าจริงจาก DHT22
-  const [sensor, setSensor] = useState<SensorData>({ temperature: 0, humidity: 0 });
-  const [loading, setLoading] = useState<boolean>(false);
   const [inBedDurationMins, setInBedDurationMins] = useState<number>(0);
   const [lastSession, setLastSession] = useState<SleepSession | null>(null);
+
+  // ประวัติจากฐานข้อมูลจริง
+  const [historyLogs, setHistoryLogs] = useState<SensorLog[]>([]);
+  const [sleepSessions, setSleepSessions] = useState<SleepSession[]>([]);
+  const [hoveredPoint, setHoveredPoint] = useState<SensorLog | null>(null);
+  const [logRange, setLogRange] = useState<number>(60); // ค่าเริ่มต้น 60 นาที
+
+  // Ref สำหรับเลื่อนกราฟซ้าย-ขวา
+  const chartScrollRef = useRef<HTMLDivElement>(null);
+
+  // Touch handlers สำหรับ Swipe สลับหน้าจอ
+  const touchStartX = useRef<number | null>(null);
+  const touchEndX = useRef<number | null>(null);
 
   useEffect(() => {
     if (localStorage.getItem(PIN_KEY) === 'true') {
@@ -74,13 +90,15 @@ export default function App() {
     }
   }, []);
 
-  // ตัวนับเวลาการนอน เชื่อมโยงผ่าน Cloud Database ซิงก์ตรงกันทุกอุปกรณ์
+  // ตัวนับเวลาการนอนสด จากเวลาจริงในระบบ
   useEffect(() => {
-    const startTimeStr = acState.session_started_at || (acState.power ? acState.updated_at : null);
-    if (!acState.power || !startTimeStr) {
+    if (!acState || !acState.power) {
       setInBedDurationMins(0);
       return;
     }
+
+    const startTimeStr = acState.session_started_at || acState.updated_at;
+    if (!startTimeStr) return;
 
     const updateDuration = () => {
       const diffMs = Date.now() - new Date(startTimeStr).getTime();
@@ -88,37 +106,54 @@ export default function App() {
     };
 
     updateDuration();
-    const interval = setInterval(updateDuration, 10000); // อัปเดตทุก 10 วินาที
+    const interval = setInterval(updateDuration, 10000);
     return () => clearInterval(interval);
-  }, [acState.power, acState.session_started_at, acState.updated_at]);
+  }, [acState]);
+
+  // ดึงข้อมูลวิเคราะห์ทั้งหมดจาก Supabase
+  const fetchAnalyticsData = async () => {
+    setRefreshing(true);
+    const { data: logs } = await supabase
+      .from('sensor_logs')
+      .select('*')
+      .order('created_at', { ascending: false })
+      .limit(logRange);
+
+    if (logs && logs.length > 0) {
+      const chronological = [...logs].reverse();
+      setHistoryLogs(chronological);
+      const latest = logs[0];
+      setSensor({ 
+        temperature: Number(latest.temperature), 
+        humidity: Number(latest.humidity) 
+      });
+    }
+
+    const { data: sessions } = await supabase
+      .from('sleep_sessions')
+      .select('*')
+      .order('started_at', { ascending: false })
+      .limit(10);
+
+    if (sessions && sessions.length > 0) {
+      setSleepSessions(sessions);
+      setLastSession(sessions[0]);
+    }
+    setRefreshing(false);
+  };
 
   useEffect(() => {
     if (!isAuthenticated) return;
 
-    const fetchData = async () => {
+    const fetchInitial = async () => {
       const { data: ac } = await supabase.from('ac_control').select('*').eq('id', 1).single();
       if (ac) setAcState(ac);
-
-      const { data: logs } = await supabase
-        .from('sensor_logs')
-        .select('temperature, humidity')
-        .order('created_at', { ascending: false })
-        .limit(1)
-        .single();
-      if (logs) setSensor(logs);
-
-      const { data: lastSleep } = await supabase
-        .from('sleep_sessions')
-        .select('*')
-        .order('started_at', { ascending: false })
-        .limit(1)
-        .single();
-      if (lastSleep) setLastSession(lastSleep);
+      await fetchAnalyticsData();
     };
 
-    fetchData();
+    fetchInitial();
 
-    // ฟังการเปลี่ยนแปลงสถานะแอร์แบบ Realtime (เปิด-ปิด, อุณหภูมิ, เวลาเริ่มนอน)
+    // ฟัง Realtime การสั่งงานแอร์
     const acChannel = supabase
       .channel('realtime_ac_control')
       .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'ac_control' }, (payload) => {
@@ -126,14 +161,16 @@ export default function App() {
       })
       .subscribe();
 
-    // ฟังค่าเซนเซอร์สดจาก ESP32 เมื่อมีการ Insert แถวใหม่
+    // ฟัง Realtime ค่าเซนเซอร์ที่ ESP32 ยิงเข้ามาใหม่
     const sensorChannel = supabase
       .channel('realtime_sensor_logs')
       .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'sensor_logs' }, (payload) => {
+        const newLog = payload.new as SensorLog;
         setSensor({
-          temperature: Number(payload.new.temperature),
-          humidity: Number(payload.new.humidity)
+          temperature: Number(newLog.temperature),
+          humidity: Number(newLog.humidity)
         });
+        setHistoryLogs((prev) => [...prev.slice(1), newLog]);
       })
       .subscribe();
 
@@ -141,7 +178,21 @@ export default function App() {
       supabase.removeChannel(acChannel);
       supabase.removeChannel(sensorChannel);
     };
-  }, [isAuthenticated]);
+  }, [isAuthenticated, logRange]);
+
+  // เลื่อนกราฟไปทางขวาสุด (จุดเวลาล่าสุด) เมื่อโหลดข้อมูลเสร็จ
+  useEffect(() => {
+    if (currentTab === 'analytics' && chartScrollRef.current) {
+      setTimeout(() => {
+        if (chartScrollRef.current) {
+          chartScrollRef.current.scrollTo({
+            left: chartScrollRef.current.scrollWidth,
+            behavior: 'smooth'
+          });
+        }
+      }, 150);
+    }
+  }, [currentTab, historyLogs.length]);
 
   const handlePinSubmit = (e: React.FormEvent) => {
     e.preventDefault();
@@ -162,18 +213,20 @@ export default function App() {
     if (durationMins >= MIN_SLEEP_THRESHOLD_MINS) {
       const { data: logs } = await supabase
         .from('sensor_logs')
-        .select('temperature, humidity')
+        .select('temperature, humidity, ac_mode')
         .gte('created_at', startTime.toISOString())
         .lte('created_at', endTime.toISOString());
 
-      let avgT = sensor.temperature;
-      let avgH = sensor.humidity;
+      let avgT = sensor.temperature || 26;
+      let avgH = sensor.humidity || 55;
+      let dryCount = 0;
 
       if (logs && logs.length > 0) {
         const sumT = logs.reduce((acc, curr) => acc + Number(curr.temperature), 0);
         const sumH = logs.reduce((acc, curr) => acc + Number(curr.humidity), 0);
         avgT = Number((sumT / logs.length).toFixed(1));
         avgH = Number((sumH / logs.length).toFixed(1));
+        dryCount = logs.filter(l => l.ac_mode === 'dry').length;
       }
 
       const newSession = {
@@ -181,15 +234,20 @@ export default function App() {
         ended_at: endTime.toISOString(),
         duration_minutes: durationMins,
         avg_temp: avgT,
-        avg_humidity: avgH
+        avg_humidity: avgH,
+        dry_mode_count: dryCount
       };
 
       const { data } = await supabase.from('sleep_sessions').insert([newSession]).select().single();
-      if (data) setLastSession(data);
+      if (data) {
+        setLastSession(data);
+        setSleepSessions(prev => [data, ...prev]);
+      }
     }
   };
 
   const updateState = async (updates: Partial<ACState>) => {
+    if (!acState) return;
     setLoading(true);
     const nextPower = updates.power !== undefined ? updates.power : acState.power;
     const nextMode = updates.mode !== undefined ? updates.mode : acState.mode;
@@ -217,10 +275,95 @@ export default function App() {
       updated_at: new Date().toISOString()
     };
 
-    setAcState((prev) => ({ ...prev, ...payload }));
+    setAcState((prev) => prev ? ({ ...prev, ...payload }) : null);
     await supabase.from('ac_control').update(payload).eq('id', 1);
     setLoading(false);
   };
+
+  // ตรวจจับท่าทาง Swipe สลับแท็บบนหน้าจอมือถือ
+  const handleTouchStart = (e: React.TouchEvent) => {
+    touchStartX.current = e.targetTouches[0].clientX;
+    touchEndX.current = null;
+  };
+
+  const handleTouchMove = (e: React.TouchEvent) => {
+    touchEndX.current = e.targetTouches[0].clientX;
+  };
+
+  const handleTouchEnd = () => {
+    if (!touchStartX.current || !touchEndX.current) return;
+    const distance = touchStartX.current - touchEndX.current;
+    const isSwipeLeft = distance > 70;
+    const isSwipeRight = distance < -70;
+
+    if (isSwipeLeft && currentTab === 'control') {
+      setCurrentTab('analytics');
+      fetchAnalyticsData();
+    } else if (isSwipeRight && currentTab === 'analytics') {
+      setCurrentTab('control');
+    }
+  };
+
+  // คำนวณสถิติจากประวัติจริง
+  const stats = useMemo(() => {
+    if (historyLogs.length === 0) {
+      return { minT: null, maxT: null, avgT: null, minH: null, maxH: null, avgH: null, optimalPercent: 0, lastSeenMins: null };
+    }
+    const temps = historyLogs.map(l => Number(l.temperature));
+    const hums = historyLogs.map(l => Number(l.humidity));
+    const minT = Math.min(...temps);
+    const maxT = Math.max(...temps);
+    const avgT = (temps.reduce((a, b) => a + b, 0) / temps.length).toFixed(1);
+    const minH = Math.min(...hums);
+    const maxH = Math.max(...hums);
+    const avgH = (hums.reduce((a, b) => a + b, 0) / hums.length).toFixed(1);
+
+    const optimalCount = historyLogs.filter(
+      l => l.humidity >= 50 && l.humidity <= 58 && l.temperature >= 25 && l.temperature <= 26.5
+    ).length;
+    const optimalPercent = Math.round((optimalCount / historyLogs.length) * 100);
+
+    const latestLogTime = new Date(historyLogs[historyLogs.length - 1].created_at).getTime();
+    const lastSeenMins = Math.floor((Date.now() - latestLogTime) / 60000);
+
+    return { minT, maxT, avgT, minH, maxH, avgH, optimalPercent, lastSeenMins };
+  }, [historyLogs]);
+
+  // คำนวณพิกัดกราฟ SVG แบบ Dynamic Width เพื่อให้เลื่อนซ้าย-ขวาได้
+  const chartData = useMemo(() => {
+    if (historyLogs.length < 2) return null;
+    const pointSpacing = 22; // ระยะห่างระหว่างแต่ละจุด (px)
+    const paddingLeft = 35;
+    const paddingRight = 35;
+    const height = 200;
+    const paddingTop = 20;
+    const paddingBottom = 30;
+
+    const width = Math.max(500, paddingLeft + paddingRight + (historyLogs.length - 1) * pointSpacing);
+
+    const tMin = 20, tMax = 35;
+    const hMin = 30, hMax = 90;
+
+    const getX = (i: number) => paddingLeft + i * pointSpacing;
+    const getYT = (val: number) => height - paddingBottom - ((val - tMin) / (tMax - tMin)) * (height - paddingTop - paddingBottom);
+    const getYH = (val: number) => height - paddingBottom - ((val - hMin) / (hMax - hMin)) * (height - paddingTop - paddingBottom);
+
+    let tempPath = `M ${getX(0)} ${getYT(Number(historyLogs[0].temperature))}`;
+    let humPath = `M ${getX(0)} ${getYH(Number(historyLogs[0].humidity))}`;
+
+    const dots = historyLogs.map((log, i) => {
+      const x = getX(i);
+      const yt = getYT(Number(log.temperature));
+      const yh = getYH(Number(log.humidity));
+      if (i > 0) {
+        tempPath += ` L ${x} ${yt}`;
+        humPath += ` L ${x} ${yh}`;
+      }
+      return { x, yt, yh, log, index: i };
+    });
+
+    return { tempPath, humPath, dots, width, height, getYH, getYT, paddingLeft, paddingRight, paddingTop, paddingBottom };
+  }, [historyLogs]);
 
   if (!isAuthenticated) {
     return (
@@ -230,7 +373,7 @@ export default function App() {
             <Lock className="h-8 w-8" />
           </div>
           <h2 className="text-xl font-bold tracking-tight text-slate-100">Climate Gate</h2>
-          <p className="mt-1 mb-6 text-xs text-slate-400">ระบุรหัส 4 หลักเพื่อควบคุมอุปกรณ์</p>
+          <p className="mt-1 mb-6 text-xs text-slate-400">ระบุรหัส 4 หลักเพื่อเข้าสู่ระบบ</p>
           <input
             type="password"
             maxLength={4}
@@ -248,13 +391,28 @@ export default function App() {
     );
   }
 
+  // หน้าจอรอเชื่อมต่อข้อมูลจริงครั้งแรก
+  if (!acState) {
+    return (
+      <div className="flex min-h-[100dvh] flex-col items-center justify-center bg-[#070b14] text-white font-sans gap-3">
+        <Loader2 className="h-8 w-8 text-cyan-400 animate-spin" />
+        <span className="text-sm font-medium text-slate-400 tracking-wide">กำลังเชื่อมต่อข้อมูลเรียลไทม์...</span>
+      </div>
+    );
+  }
+
   const isDry = acState.power && acState.mode === 'dry';
   const isCool = acState.power && acState.mode === 'cool';
-  const isHighHumidity = sensor.humidity >= 62.0;
-  const isOptimal = sensor.humidity >= 50 && sensor.humidity <= 58 && sensor.temperature >= 25.0 && sensor.temperature <= 26.5;
+  const isHighHumidity = (sensor.humidity ?? 0) >= 62.0;
+  const isOptimal = (sensor.humidity ?? 0) >= 50 && (sensor.humidity ?? 0) <= 58 && (sensor.temperature ?? 0) >= 25.0 && (sensor.temperature ?? 0) <= 26.5;
 
   return (
-    <div className="min-h-[100dvh] bg-[#070b14] text-slate-100 flex flex-col items-center justify-between p-5 pb-6 font-sans select-none antialiased">
+    <div 
+      onTouchStart={handleTouchStart}
+      onTouchMove={handleTouchMove}
+      onTouchEnd={handleTouchEnd}
+      className="min-h-[100dvh] bg-[#070b14] text-slate-100 flex flex-col items-center justify-between p-4 pb-20 font-sans select-none antialiased"
+    >
       {/* 1. Header Bar */}
       <header className="w-full max-w-md flex items-center justify-between pt-1 pb-2">
         <div>
@@ -278,241 +436,486 @@ export default function App() {
         </button>
       </header>
 
-      {/* 2. Room Sensor Badges */}
-      <div className="w-full max-w-md space-y-2">
-        <div className="grid grid-cols-2 gap-3">
-          <div className="rounded-2xl bg-slate-900/60 border border-slate-800/80 p-3.5 flex items-center gap-3 backdrop-blur-md">
-            <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-amber-500/10 text-amber-400 border border-amber-500/20">
-              <Thermometer className="h-5 w-5" />
-            </div>
-            <div>
-              <div className="text-[10px] uppercase font-bold tracking-wider text-slate-400">อุณหภูมิห้อง</div>
-              <div className="text-xl font-bold tracking-tight text-white">
-                {sensor.temperature > 0 ? Number(sensor.temperature).toFixed(1) : '--'}
-                <span className="text-xs font-normal text-slate-400 ml-0.5">°C</span>
-              </div>
-            </div>
-          </div>
-
-          <div className="rounded-2xl bg-slate-900/60 border border-slate-800/80 p-3.5 flex items-center gap-3 backdrop-blur-md">
-            <div className={`flex h-10 w-10 items-center justify-center rounded-xl border ${
-              isHighHumidity 
-                ? 'bg-rose-500/10 text-rose-400 border-rose-500/20 animate-pulse' 
-                : 'bg-cyan-500/10 text-cyan-400 border-cyan-500/20'
-            }`}>
-              <Droplets className="h-5 w-5" />
-            </div>
-            <div>
-              <div className="text-[10px] uppercase font-bold tracking-wider text-slate-400">ความชื้นห้อง</div>
-              <div className={`text-xl font-bold tracking-tight ${isHighHumidity ? 'text-rose-400' : 'text-white'}`}>
-                {sensor.humidity > 0 ? Number(sensor.humidity).toFixed(1) : '--'}
-                <span className="text-xs font-normal text-slate-400 ml-0.5">%RH</span>
-              </div>
-            </div>
-          </div>
-        </div>
-
-        <div className="flex items-center justify-between px-3 py-1.5 rounded-xl bg-slate-900/40 border border-slate-800/50 text-[11px]">
-          <span className="text-slate-400">ประเมินสภาพอากาศ:</span>
-          {sensor.temperature === 0 ? (
-            <span className="text-slate-500">รอรับสัญญาณสดจาก DHT22...</span>
-          ) : isOptimal ? (
-            <span className="text-emerald-400 font-semibold flex items-center gap-1">
-              <CheckCircle2 className="h-3 w-3" /> สบายผิว & ทางเดินหายใจโล่ง
-            </span>
-          ) : isHighHumidity ? (
-            <span className="text-rose-400 font-semibold">ชื้นสูงเกินเกณฑ์ เสี่ยงไรฝุ่นสะสม</span>
-          ) : sensor.humidity < 50 ? (
-            <span className="text-amber-400 font-semibold">อากาศแห้ง เสี่ยงผิวแห้งคัน</span>
-          ) : (
-            <span className="text-slate-400 font-medium">กำลังปรับสมดุลอากาศ</span>
-          )}
-        </div>
-      </div>
-
-      {/* 3. Central Climate Ring & Live Session Tracker */}
-      <div className="relative flex flex-col items-center justify-center my-auto py-2">
-        <div className={`absolute h-60 w-60 rounded-full blur-3xl transition-opacity duration-700 pointer-events-none ${
-          !acState.power 
-            ? 'bg-transparent' 
-            : isDry 
-              ? 'bg-blue-600/20' 
-              : 'bg-cyan-500/25'
-        }`} />
-
-        <div className="relative flex h-60 w-60 items-center justify-center rounded-full border border-slate-800/90 bg-slate-950/70 p-4 shadow-[inset_0_2px_12px_rgba(0,0,0,0.8)] backdrop-blur-2xl">
-          <div className={`flex h-full w-full flex-col items-center justify-center rounded-full border transition-all duration-500 ${
-            !acState.power 
-              ? 'border-slate-800/60 bg-slate-900/30 text-slate-600' 
-              : isDry
-                ? 'border-blue-500/40 bg-gradient-to-b from-blue-950/40 to-slate-950 text-blue-300 shadow-[0_0_30px_rgba(59,130,246,0.2)]'
-                : 'border-cyan-500/40 bg-gradient-to-b from-cyan-950/40 to-slate-950 text-cyan-300 shadow-[0_0_30px_rgba(6,182,212,0.2)]'
-          }`}>
-            {acState.power ? (
-              <>
-                <div className="flex items-center gap-1.5 text-xs font-semibold uppercase tracking-widest text-slate-400 mb-1">
-                  {isDry ? <Droplets className="h-3.5 w-3.5 text-blue-400" /> : <Snowflake className="h-3.5 w-3.5 text-cyan-400" />}
-                  {isDry ? 'Dry Mode' : 'Cooling'}
+      {/* ======================= TAB 1: ควบคุมแอร์ (REMOTE CONTROL) ======================= */}
+      {currentTab === 'control' && (
+        <div className="w-full max-w-md flex-1 flex flex-col justify-between py-1 animate-fadeIn">
+          {/* Room Sensor Badges */}
+          <div className="space-y-2">
+            <div className="grid grid-cols-2 gap-3">
+              <div className="rounded-2xl bg-slate-900/60 border border-slate-800/80 p-3.5 flex items-center gap-3 backdrop-blur-md">
+                <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-amber-500/10 text-amber-400 border border-amber-500/20">
+                  <Thermometer className="h-5 w-5" />
                 </div>
-                
-                <div className="flex items-baseline justify-center">
-                  <span className="text-6xl font-extrabold tracking-tighter text-white">
-                    {isDry ? '--' : acState.target_temp}
+                <div>
+                  <div className="text-[10px] uppercase font-bold tracking-wider text-slate-400">อุณหภูมิห้อง</div>
+                  <div className="text-xl font-bold tracking-tight text-white">
+                    {sensor.temperature !== null ? sensor.temperature.toFixed(1) : '--'}
+                    <span className="text-xs font-normal text-slate-400 ml-0.5">°C</span>
+                  </div>
+                </div>
+              </div>
+
+              <div className="rounded-2xl bg-slate-900/60 border border-slate-800/80 p-3.5 flex items-center gap-3 backdrop-blur-md">
+                <div className={`flex h-10 w-10 items-center justify-center rounded-xl border ${
+                  isHighHumidity 
+                    ? 'bg-rose-500/10 text-rose-400 border-rose-500/20 animate-pulse' 
+                    : 'bg-cyan-500/10 text-cyan-400 border-cyan-500/20'
+                }`}>
+                  <Droplets className="h-5 w-5" />
+                </div>
+                <div>
+                  <div className="text-[10px] uppercase font-bold tracking-wider text-slate-400">ความชื้นห้อง</div>
+                  <div className={`text-xl font-bold tracking-tight ${isHighHumidity ? 'text-rose-400' : 'text-white'}`}>
+                    {sensor.humidity !== null ? sensor.humidity.toFixed(1) : '--'}
+                    <span className="text-xs font-normal text-slate-400 ml-0.5">%RH</span>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <div className="flex items-center justify-between px-3 py-1.5 rounded-xl bg-slate-900/40 border border-slate-800/50 text-[11px]">
+              <span className="text-slate-400">ประเมินสภาพอากาศ:</span>
+              {sensor.temperature === null ? (
+                <span className="text-slate-500">รอรับสัญญาณสดจาก DHT22...</span>
+              ) : isOptimal ? (
+                <span className="text-emerald-400 font-semibold flex items-center gap-1">
+                  <CheckCircle2 className="h-3 w-3" /> สบายผิว & ทางเดินหายใจโล่ง
+                </span>
+              ) : isHighHumidity ? (
+                <span className="text-rose-400 font-semibold">ชื้นสูงเกินเกณฑ์ เสี่ยงไรฝุ่นสะสม</span>
+              ) : (sensor.humidity ?? 0) < 50 ? (
+                <span className="text-amber-400 font-semibold">อากาศแห้ง เสี่ยงผิวแห้งคัน</span>
+              ) : (
+                <span className="text-slate-400 font-medium">กำลังปรับสมดุลอากาศ</span>
+              )}
+            </div>
+          </div>
+
+          {/* Central Climate Ring */}
+          <div className="relative flex flex-col items-center justify-center my-auto py-2">
+            <div className={`absolute h-56 w-56 rounded-full blur-3xl transition-opacity duration-700 pointer-events-none ${
+              !acState.power 
+                ? 'bg-transparent' 
+                : isDry 
+                  ? 'bg-blue-600/20' 
+                  : 'bg-cyan-500/25'
+            }`} />
+
+            <div className="relative flex h-56 w-56 items-center justify-center rounded-full border border-slate-800/90 bg-slate-950/70 p-4 shadow-[inset_0_2px_12px_rgba(0,0,0,0.8)] backdrop-blur-2xl">
+              <div className={`flex h-full w-full flex-col items-center justify-center rounded-full border transition-all duration-500 ${
+                !acState.power 
+                  ? 'border-slate-800/60 bg-slate-900/30 text-slate-600' 
+                  : isDry
+                    ? 'border-blue-500/40 bg-gradient-to-b from-blue-950/40 to-slate-950 text-blue-300 shadow-[0_0_30px_rgba(59,130,246,0.2)]'
+                    : 'border-cyan-500/40 bg-gradient-to-b from-cyan-950/40 to-slate-950 text-cyan-300 shadow-[0_0_30px_rgba(6,182,212,0.2)]'
+              }`}>
+                {acState.power ? (
+                  <>
+                    <div className="flex items-center gap-1.5 text-xs font-semibold uppercase tracking-widest text-slate-400 mb-1">
+                      {isDry ? <Droplets className="h-3.5 w-3.5 text-blue-400" /> : <Snowflake className="h-3.5 w-3.5 text-cyan-400" />}
+                      {isDry ? 'Dry Mode' : 'Cooling'}
+                    </div>
+                    
+                    <div className="flex items-baseline justify-center">
+                      <span className="text-6xl font-extrabold tracking-tighter text-white">
+                        {isDry ? '--' : acState.target_temp}
+                      </span>
+                      {!isDry && <span className="text-2xl font-light text-slate-400 ml-1">°C</span>}
+                    </div>
+
+                    <div className="mt-2 flex items-center gap-1.5 text-[11px] font-medium text-slate-400 bg-slate-900/80 px-2.5 py-1 rounded-full border border-slate-800">
+                      <Wind className="h-3 w-3 text-cyan-400" />
+                      <span>Fixed Low Fan</span>
+                    </div>
+                  </>
+                ) : (
+                  <div className="flex flex-col items-center text-slate-500">
+                    <Power className="h-10 w-10 mb-2 stroke-[1.5]" />
+                    <span className="text-sm font-semibold tracking-wider uppercase">System OFF</span>
+                  </div>
+                )}
+              </div>
+            </div>
+
+            {acState.power && (
+              <div className="mt-3 flex items-center gap-2 px-3.5 py-1.5 rounded-full bg-slate-900/80 border border-slate-800 text-xs text-slate-300">
+                <Moon className="h-3.5 w-3.5 text-cyan-400" />
+                <span>เข้าห้องนอนแล้ว: <strong>{inBedDurationMins} นาที</strong></span>
+                {inBedDurationMins >= MIN_SLEEP_THRESHOLD_MINS ? (
+                  <span className="text-[10px] text-emerald-400 bg-emerald-500/10 px-2 py-0.5 rounded-full border border-emerald-500/20">
+                    บันทึกการนอนจริง
                   </span>
-                  {!isDry && <span className="text-2xl font-light text-slate-400 ml-1">°C</span>}
-                </div>
-
-                <div className="mt-2 flex items-center gap-1.5 text-[11px] font-medium text-slate-400 bg-slate-900/80 px-2.5 py-1 rounded-full border border-slate-800">
-                  <Wind className="h-3 w-3 text-cyan-400" />
-                  <span>Fixed Low Fan</span>
-                </div>
-              </>
-            ) : (
-              <div className="flex flex-col items-center text-slate-500">
-                <Power className="h-10 w-10 mb-2 stroke-[1.5]" />
-                <span className="text-sm font-semibold tracking-wider uppercase">System OFF</span>
+                ) : (
+                  <span className="text-[10px] text-amber-400 bg-amber-500/10 px-2 py-0.5 rounded-full border border-amber-500/20">
+                    ช่วงวอร์ม (15 น.)
+                  </span>
+                )}
               </div>
             )}
           </div>
-        </div>
 
-        {acState.power && (
-          <div className="mt-3 flex items-center gap-2 px-3.5 py-1.5 rounded-full bg-slate-900/80 border border-slate-800 text-xs text-slate-300">
-            <Moon className="h-3.5 w-3.5 text-cyan-400" />
-            <span>เข้าห้องนอนแล้ว: <strong>{inBedDurationMins} นาที</strong></span>
-            {inBedDurationMins >= MIN_SLEEP_THRESHOLD_MINS ? (
-              <span className="text-[10px] text-emerald-400 bg-emerald-500/10 px-2 py-0.5 rounded-full border border-emerald-500/20">
-                บันทึกการนอนจริง
-              </span>
-            ) : (
-              <span className="text-[10px] text-amber-400 bg-amber-500/10 px-2 py-0.5 rounded-full border border-amber-500/20">
-                ช่วงวอร์ม (15 น.)
-              </span>
-            )}
+          {/* Controls */}
+          <div className="space-y-2.5">
+            <div className="grid grid-cols-4 gap-2">
+              <button
+                disabled={loading || !acState.power || isDry || acState.target_temp <= 18}
+                onClick={() => updateState({ target_temp: acState.target_temp - 1, mode: 'cool' })}
+                className="py-3 rounded-2xl bg-slate-900/80 border border-slate-800 flex items-center justify-center text-slate-300 hover:text-white disabled:opacity-30 active:scale-95"
+              >
+                <ChevronDown className="h-5 w-5" />
+              </button>
+
+              <button
+                disabled={loading || !acState.power || isDry}
+                onClick={() => updateState({ target_temp: 25, mode: 'cool' })}
+                className={`py-3 px-2 rounded-2xl border text-xs font-semibold flex flex-col items-center justify-center gap-1 transition active:scale-95 ${
+                  acState.power && isCool && acState.target_temp === 25
+                    ? 'bg-cyan-500 text-slate-950 border-cyan-400 shadow-[0_0_12px_rgba(6,182,212,0.3)]'
+                    : 'bg-slate-900/70 border-slate-800 text-slate-400 disabled:opacity-30'
+                }`}
+              >
+                <SunDim className="h-3.5 w-3.5" />
+                25°C Chill
+              </button>
+
+              <button
+                disabled={loading || !acState.power || isDry}
+                onClick={() => updateState({ target_temp: 26, mode: 'cool' })}
+                className={`py-3 px-2 rounded-2xl border text-xs font-semibold flex flex-col items-center justify-center gap-1 transition active:scale-95 ${
+                  acState.power && isCool && acState.target_temp === 26
+                    ? 'bg-cyan-500 text-slate-950 border-cyan-400 shadow-[0_0_12px_rgba(6,182,212,0.3)]'
+                    : 'bg-slate-900/70 border-slate-800 text-slate-400 disabled:opacity-30'
+                }`}
+              >
+                <Sparkles className="h-3.5 w-3.5" />
+                26°C Safe
+              </button>
+
+              <button
+                disabled={loading || !acState.power || isDry || acState.target_temp >= 30}
+                onClick={() => updateState({ target_temp: acState.target_temp + 1, mode: 'cool' })}
+                className="py-3 rounded-2xl bg-slate-900/80 border border-slate-800 flex items-center justify-center text-slate-300 hover:text-white disabled:opacity-30 active:scale-95"
+              >
+                <ChevronUp className="h-5 w-5" />
+              </button>
+            </div>
+
+            <div className="grid grid-cols-3 gap-2">
+              <button
+                disabled={loading || !acState.power}
+                onClick={() => updateState({ mode: 'cool' })}
+                className={`py-3 rounded-2xl border text-xs font-semibold flex flex-col items-center justify-center gap-1.5 transition active:scale-95 ${
+                  isCool
+                    ? 'bg-cyan-500/20 border-cyan-500/50 text-cyan-300'
+                    : 'bg-slate-900/70 border-slate-800 text-slate-400 disabled:opacity-30'
+                }`}
+              >
+                <Snowflake className="h-4 w-4" />
+                Cool
+              </button>
+
+              <button
+                disabled={loading || !acState.power}
+                onClick={() => updateState({ mode: 'dry' })}
+                className={`py-3 rounded-2xl border text-xs font-semibold flex flex-col items-center justify-center gap-1.5 transition active:scale-95 ${
+                  isDry
+                    ? 'bg-blue-500/20 border-blue-500/50 text-blue-300'
+                    : 'bg-slate-900/70 border-slate-800 text-slate-400 disabled:opacity-30'
+                }`}
+              >
+                <Droplets className="h-4 w-4" />
+                Dry (ลดชื้น)
+              </button>
+
+              <button
+                disabled={loading}
+                onClick={() => updateState({ power: !acState.power })}
+                className={`py-3 rounded-2xl border text-xs font-semibold flex flex-col items-center justify-center gap-1.5 transition active:scale-95 ${
+                  acState.power
+                    ? 'bg-rose-500/20 border-rose-500/50 text-rose-400 shadow-[0_0_14px_rgba(244,63,94,0.2)]'
+                    : 'bg-slate-900/80 border-slate-800 text-slate-400 hover:text-white'
+                }`}
+              >
+                <Power className="h-4 w-4" />
+                {acState.power ? 'Turn OFF' : 'Turn ON'}
+              </button>
+            </div>
+
+            <div className="rounded-xl bg-slate-950 border border-slate-900 px-3.5 py-1.5 flex items-center justify-between text-[10px] text-slate-400 font-mono">
+              <div className="flex items-center gap-1.5">
+                <span className="h-1.5 w-1.5 rounded-full bg-cyan-500" />
+                <span>IR: {acState.last_command_code}</span>
+              </div>
+              <span>LG 28-bit Protocol</span>
+            </div>
           </div>
-        )}
-      </div>
-
-      {/* 4. Controls (ปรับอุณหภูมิอิสระ 18°C - 30°C) */}
-      <div className="w-full max-w-md space-y-2.5">
-        <div className="grid grid-cols-4 gap-2">
-          {/* ลดอุณหภูมิทีละ 1 องศา ลงได้สุดถึง 18°C */}
-          <button
-            disabled={loading || !acState.power || isDry || acState.target_temp <= 18}
-            onClick={() => updateState({ target_temp: acState.target_temp - 1, mode: 'cool' })}
-            className="py-3 rounded-2xl bg-slate-900/80 border border-slate-800 flex items-center justify-center text-slate-300 hover:text-white disabled:opacity-30 active:scale-95"
-          >
-            <ChevronDown className="h-5 w-5" />
-          </button>
-
-          <button
-            disabled={loading || !acState.power || isDry}
-            onClick={() => updateState({ target_temp: 25, mode: 'cool' })}
-            className={`py-3 px-2 rounded-2xl border text-xs font-semibold flex flex-col items-center justify-center gap-1 transition active:scale-95 ${
-              acState.power && isCool && acState.target_temp === 25
-                ? 'bg-cyan-500 text-slate-950 border-cyan-400 shadow-[0_0_12px_rgba(6,182,212,0.3)]'
-                : 'bg-slate-900/70 border-slate-800 text-slate-400 disabled:opacity-30'
-            }`}
-          >
-            <SunDim className="h-3.5 w-3.5" />
-            25°C Chill
-          </button>
-
-          <button
-            disabled={loading || !acState.power || isDry}
-            onClick={() => updateState({ target_temp: 26, mode: 'cool' })}
-            className={`py-3 px-2 rounded-2xl border text-xs font-semibold flex flex-col items-center justify-center gap-1 transition active:scale-95 ${
-              acState.power && isCool && acState.target_temp === 26
-                ? 'bg-cyan-500 text-slate-950 border-cyan-400 shadow-[0_0_12px_rgba(6,182,212,0.3)]'
-                : 'bg-slate-900/70 border-slate-800 text-slate-400 disabled:opacity-30'
-            }`}
-          >
-            <Sparkles className="h-3.5 w-3.5" />
-            26°C Safe
-          </button>
-
-          {/* เพิ่มอุณหภูมิทีละ 1 องศา ขึ้นได้สุดถึง 30°C */}
-          <button
-            disabled={loading || !acState.power || isDry || acState.target_temp >= 30}
-            onClick={() => updateState({ target_temp: acState.target_temp + 1, mode: 'cool' })}
-            className="py-3 rounded-2xl bg-slate-900/80 border border-slate-800 flex items-center justify-center text-slate-300 hover:text-white disabled:opacity-30 active:scale-95"
-          >
-            <ChevronUp className="h-5 w-5" />
-          </button>
         </div>
+      )}
 
-        <div className="grid grid-cols-3 gap-2">
-          <button
-            disabled={loading || !acState.power}
-            onClick={() => updateState({ mode: 'cool' })}
-            className={`py-3 rounded-2xl border text-xs font-semibold flex flex-col items-center justify-center gap-1.5 transition active:scale-95 ${
-              isCool
-                ? 'bg-cyan-500/20 border-cyan-500/50 text-cyan-300'
-                : 'bg-slate-900/70 border-slate-800 text-slate-400 disabled:opacity-30'
-            }`}
-          >
-            <Snowflake className="h-4 w-4" />
-            Cool
-          </button>
-
-          <button
-            disabled={loading || !acState.power}
-            onClick={() => updateState({ mode: 'dry' })}
-            className={`py-3 rounded-2xl border text-xs font-semibold flex flex-col items-center justify-center gap-1.5 transition active:scale-95 ${
-              isDry
-                ? 'bg-blue-500/20 border-blue-500/50 text-blue-300'
-                : 'bg-slate-900/70 border-slate-800 text-slate-400 disabled:opacity-30'
-            }`}
-          >
-            <Droplets className="h-4 w-4" />
-            Dry (ลดชื้น)
-          </button>
-
-          <button
-            disabled={loading}
-            onClick={() => updateState({ power: !acState.power })}
-            className={`py-3 rounded-2xl border text-xs font-semibold flex flex-col items-center justify-center gap-1.5 transition active:scale-95 ${
-              acState.power
-                ? 'bg-rose-500/20 border-rose-500/50 text-rose-400 shadow-[0_0_14px_rgba(244,63,94,0.2)]'
-                : 'bg-slate-900/80 border-slate-800 text-slate-400 hover:text-white'
-            }`}
-          >
-            <Power className="h-4 w-4" />
-            {acState.power ? 'Turn OFF' : 'Turn ON'}
-          </button>
-        </div>
-
-        {lastSession && (
-          <div className="rounded-2xl bg-slate-900/50 border border-slate-800/80 p-3 flex items-center justify-between text-xs backdrop-blur-md">
+      {/* ======================= TAB 2: กราฟ & วิเคราะห์ระบบ (ANALYTICS & LOGS) ======================= */}
+      {currentTab === 'analytics' && (
+        <div className="w-full max-w-md flex-1 space-y-4 py-1 overflow-y-auto pr-0.5 animate-fadeIn">
+          {/* Header Controls */}
+          <div className="flex items-center justify-between">
             <div className="flex items-center gap-2">
-              <div className="flex h-8 w-8 items-center justify-center rounded-xl bg-indigo-500/10 text-indigo-400 border border-indigo-500/20">
-                <Clock className="h-4 w-4" />
+              <Activity className="h-4 w-4 text-cyan-400" />
+              <span className="text-xs font-bold uppercase tracking-wider text-slate-300">ประวัติสภาพอากาศจริง</span>
+            </div>
+
+            <div className="flex items-center gap-2">
+              <select
+                value={logRange}
+                onChange={(e) => setLogRange(Number(e.target.value))}
+                className="bg-slate-900 text-slate-300 text-[11px] rounded-lg px-2 py-1 border border-slate-800 focus:outline-none"
+              >
+                <option value={30}>30 นาทีล่าสุด</option>
+                <option value={60}>1 ชม. ล่าสุด</option>
+                <option value={180}>3 ชม. ล่าสุด</option>
+                <option value={360}>6 ชม. ล่าสุด</option>
+              </select>
+
+              <button
+                onClick={fetchAnalyticsData}
+                disabled={refreshing}
+                className="p-1 rounded-lg bg-slate-900 border border-slate-800 text-slate-400 hover:text-white active:scale-95"
+              >
+                <RefreshCw className={`h-3.5 w-3.5 ${refreshing ? 'animate-spin text-cyan-400' : ''}`} />
+              </button>
+            </div>
+          </div>
+
+          {/* Metrics Grid */}
+          <div className="grid grid-cols-3 gap-2">
+            <div className="rounded-xl bg-slate-900/60 border border-slate-800 p-2.5 text-center">
+              <div className="text-[10px] text-slate-400 uppercase font-semibold">ESP32 Status</div>
+              <div className="mt-1 flex items-center justify-center gap-1.5">
+                {stats.lastSeenMins !== null ? (
+                  <>
+                    <span className={`h-2 w-2 rounded-full ${stats.lastSeenMins <= 3 ? 'bg-emerald-400 animate-pulse' : 'bg-rose-500'}`} />
+                    <span className="text-xs font-bold text-slate-200">
+                      {stats.lastSeenMins <= 3 ? 'Online' : `${stats.lastSeenMins}น. ที่แล้ว`}
+                    </span>
+                  </>
+                ) : (
+                  <span className="text-xs font-medium text-slate-500">รอเชื่อมต่อ</span>
+                )}
               </div>
-              <div>
-                <div className="text-[10px] text-slate-400 uppercase font-semibold">การนอนครั้งล่าสุด</div>
-                <div className="font-medium text-slate-200">
-                  {Math.floor((lastSession.duration_minutes || 0) / 60)} ชม. {(lastSession.duration_minutes || 0) % 60} นาที
+            </div>
+
+            <div className="rounded-xl bg-slate-900/60 border border-slate-800 p-2.5 text-center">
+              <div className="text-[10px] text-slate-400 uppercase font-semibold">ช่วงอุณหภูมิ</div>
+              <div className="mt-1 text-xs font-bold text-amber-400">
+                {stats.minT !== null ? `${stats.minT} - ${stats.maxT}°C` : '--'}
+              </div>
+            </div>
+
+            <div className="rounded-xl bg-slate-900/60 border border-slate-800 p-2.5 text-center">
+              <div className="text-[10px] text-slate-400 uppercase font-semibold">Healthy Zone</div>
+              <div className="mt-1 text-xs font-bold text-emerald-400">
+                {historyLogs.length > 0 ? `${stats.optimalPercent}%` : '--'}
+              </div>
+            </div>
+          </div>
+
+          {/* Horizontal Scrollable Interactive Chart */}
+          <div className="rounded-2xl bg-slate-900/80 border border-slate-800 p-3.5 backdrop-blur-xl">
+            <div className="flex items-center justify-between mb-2 text-[11px]">
+              <div className="flex items-center gap-3">
+                <span className="flex items-center gap-1 text-amber-400 font-semibold">
+                  <span className="h-2 w-2 rounded-full bg-amber-400" /> อุณหภูมิ (°C)
+                </span>
+                <span className="flex items-center gap-1 text-cyan-400 font-semibold">
+                  <span className="h-2 w-2 rounded-full bg-cyan-400" /> ความชื้น (%RH)
+                </span>
+              </div>
+              <span className="text-[10px] text-slate-500 font-mono">เลื่อนซ้าย-ขวาเพื่อดูไทม์ไลน์ ➔</span>
+            </div>
+
+            {/* Container ที่เลื่อนซ้าย-ขวาได้อิสระ */}
+            <div 
+              ref={chartScrollRef}
+              onTouchStart={(e) => e.stopPropagation()}
+              onTouchMove={(e) => e.stopPropagation()}
+              onTouchEnd={(e) => e.stopPropagation()}
+              className="relative w-full h-52 bg-slate-950/70 rounded-xl overflow-x-auto overflow-y-hidden border border-slate-900 scrollbar-thin scrollbar-thumb-slate-800"
+            >
+              {chartData ? (
+                <div style={{ width: `${chartData.width}px` }} className="h-full relative">
+                  <svg 
+                    viewBox={`0 0 ${chartData.width} ${chartData.height}`} 
+                    className="w-full h-full block"
+                  >
+                    {/* แถบ Healthy Humidity Zone (50 - 58 %RH) */}
+                    <rect
+                      x="0"
+                      y={chartData.getYH(58)}
+                      width={chartData.width}
+                      height={chartData.getYH(50) - chartData.getYH(58)}
+                      fill="rgba(16, 185, 129, 0.08)"
+                    />
+                    
+                    {/* เส้นเตือนชื้นสูงวิกฤต (62 %RH) */}
+                    <line
+                      x1="0"
+                      y1={chartData.getYH(62)}
+                      x2={chartData.width}
+                      y2={chartData.getYH(62)}
+                      stroke="rgba(244, 63, 94, 0.4)"
+                      strokeDasharray="4 4"
+                      strokeWidth="1"
+                    />
+
+                    {/* เส้นกราฟความชื้น (%RH) */}
+                    <path
+                      d={chartData.humPath}
+                      fill="none"
+                      stroke="#06b6d4"
+                      strokeWidth="2.2"
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                    />
+
+                    {/* เส้นกราฟอุณหภูมิ (°C) */}
+                    <path
+                      d={chartData.tempPath}
+                      fill="none"
+                      stroke="#f59e0b"
+                      strokeWidth="2.2"
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                    />
+
+                    {/* จุดบนกราฟและแกนเวลา */}
+                    {chartData.dots.map((d, i) => (
+                      <g key={i} className="cursor-pointer" onClick={() => setHoveredPoint(d.log)}>
+                        {/* ป้ายแสดงเวลาทุกๆ 5 จุด */}
+                        {i % 5 === 0 && (
+                          <text
+                            x={d.x}
+                            y={chartData.height - 8}
+                            fill="#64748b"
+                            fontSize="9"
+                            fontFamily="monospace"
+                            textAnchor="middle"
+                          >
+                            {new Date(d.log.created_at).toLocaleTimeString('th-TH', { hour: '2-digit', minute: '2-digit' })}
+                          </text>
+                        )}
+
+                        {/* สัญลักษณ์หากเป็น Dry Mode */}
+                        {d.log.ac_mode === 'dry' && (
+                          <circle cx={d.x} cy={d.yh} r="4.5" fill="#3b82f6" stroke="#ffffff" strokeWidth="1.5" />
+                        )}
+
+                        {/* จุดอุณหภูมิ */}
+                        <circle
+                          cx={d.x}
+                          cy={d.yt}
+                          r={hoveredPoint?.id === d.log.id ? "5.5" : "2.5"}
+                          fill="#f59e0b"
+                        />
+                      </g>
+                    ))}
+                  </svg>
+                </div>
+              ) : (
+                <div className="flex h-full items-center justify-center text-xs text-slate-500">
+                  รอรับข้อมูลจาก ESP32 อย่างน้อย 2 บันทึก...
+                </div>
+              )}
+            </div>
+
+            {/* Tooltip เมื่อแตะจุดกราฟ */}
+            {hoveredPoint ? (
+              <div className="mt-2.5 rounded-xl bg-slate-950 p-2.5 border border-slate-800 flex items-center justify-between text-xs animate-fadeIn">
+                <div>
+                  <div className="text-[10px] text-slate-400 font-mono">
+                    เวลา: {new Date(hoveredPoint.created_at).toLocaleTimeString('th-TH', { hour: '2-digit', minute: '2-digit', second: '2-digit' })}
+                  </div>
+                  <div className="font-semibold text-slate-200 mt-0.5">
+                    แอร์โหมด: <span className="uppercase text-cyan-400">{hoveredPoint.ac_mode || 'Cool'}</span>
+                  </div>
+                </div>
+                <div className="text-right">
+                  <div className="text-amber-400 font-bold">{hoveredPoint.temperature}°C</div>
+                  <div className="text-cyan-400 font-bold">{hoveredPoint.humidity}%RH</div>
                 </div>
               </div>
+            ) : (
+              <p className="mt-2 text-center text-[10px] text-slate-500">ปัดซ้าย-ขวา แล้วแตะที่จุดบนกราฟเพื่อดูเวลาที่เกิดเหตุการณ์</p>
+            )}
+          </div>
+
+          {/* Timeline เหตุการณ์จริง */}
+          <div className="rounded-2xl bg-slate-900/80 border border-slate-800 p-3.5 backdrop-blur-xl">
+            <div className="flex items-center gap-2 mb-3">
+              <Clock className="h-4 w-4 text-cyan-400" />
+              <h3 className="text-xs font-bold uppercase tracking-wider text-slate-200">ไทม์ไลน์เซสชันการนอนจริง</h3>
             </div>
 
-            <div className="text-right">
-              <div className="text-[10px] text-slate-400">เฉลี่ยตลอดคืน</div>
-              <div className="font-medium text-cyan-400">
-                {lastSession.avg_temp}°C • {lastSession.avg_humidity}%RH
+            {sleepSessions.length > 0 ? (
+              <div className="space-y-3 relative before:absolute before:inset-0 before:left-3 before:w-0.5 before:bg-slate-800">
+                {sleepSessions.map((s, idx) => (
+                  <div key={idx} className="relative flex items-start gap-3 pl-1">
+                    <span className="h-4 w-4 rounded-full bg-indigo-500/20 border border-indigo-400 flex items-center justify-center mt-0.5 z-10">
+                      <Moon className="h-2.5 w-2.5 text-indigo-400" />
+                    </span>
+                    <div className="flex-1 text-xs bg-slate-950/60 p-2.5 rounded-xl border border-slate-800/80">
+                      <div className="flex items-center justify-between text-[10px] text-slate-400 font-mono mb-1">
+                        <span>{new Date(s.started_at).toLocaleDateString('th-TH')}</span>
+                        <span>{Math.floor((s.duration_minutes || 0) / 60)} ชม. {(s.duration_minutes || 0) % 60} น.</span>
+                      </div>
+                      <div className="font-semibold text-indigo-300">
+                        {new Date(s.started_at).toLocaleTimeString('th-TH', { hour: '2-digit', minute: '2-digit' })} - {s.ended_at ? new Date(s.ended_at).toLocaleTimeString('th-TH', { hour: '2-digit', minute: '2-digit' }) : 'กำลังนอน'}
+                      </div>
+                      <div className="text-[11px] text-slate-400 mt-1 flex items-center justify-between">
+                        <span>เฉลี่ย: {s.avg_temp}°C • {s.avg_humidity}%RH</span>
+                        {s.dry_mode_count ? (
+                          <span className="text-blue-400 text-[10px]">ตัด Dry {s.dry_mode_count} ครั้ง</span>
+                        ) : null}
+                      </div>
+                    </div>
+                  </div>
+                ))}
               </div>
-            </div>
+            ) : (
+              <div className="py-4 text-center text-xs text-slate-500">
+                ยังไม่มีประวัติการนอนที่บันทึก (ระบบจะบันทึกเมื่อเปิดแอร์ต่อเนื่องเกิน 15 นาที)
+              </div>
+            )}
           </div>
-        )}
-
-        <div className="rounded-xl bg-slate-950 border border-slate-900 px-3.5 py-1.5 flex items-center justify-between text-[10px] text-slate-400 font-mono">
-          <div className="flex items-center gap-1.5">
-            <span className="h-1.5 w-1.5 rounded-full bg-cyan-500" />
-            <span>IR: {acState.last_command_code}</span>
-          </div>
-          <span>LG 28-bit Protocol</span>
         </div>
-      </div>
+      )}
+
+      {/* ======================= BOTTOM NAVIGATION DOCK ======================= */}
+      <nav className="fixed bottom-3 w-[calc(100%-2rem)] max-w-md bg-slate-900/90 border border-slate-800 rounded-2xl p-1.5 backdrop-blur-xl shadow-2xl flex items-center justify-around z-50">
+        <button
+          onClick={() => setCurrentTab('control')}
+          className={`flex-1 flex items-center justify-center gap-2 py-2.5 rounded-xl text-xs font-semibold transition active:scale-95 ${
+            currentTab === 'control'
+              ? 'bg-cyan-500 text-slate-950 shadow-lg shadow-cyan-500/20'
+              : 'text-slate-400 hover:text-white'
+          }`}
+        >
+          <Sliders className="h-4 w-4" />
+          <span>ควบคุมแอร์</span>
+        </button>
+
+        <button
+          onClick={() => {
+            setCurrentTab('analytics');
+            fetchAnalyticsData();
+          }}
+          className={`flex-1 flex items-center justify-center gap-2 py-2.5 rounded-xl text-xs font-semibold transition active:scale-95 ${
+            currentTab === 'analytics'
+              ? 'bg-cyan-500 text-slate-950 shadow-lg shadow-cyan-500/20'
+              : 'text-slate-400 hover:text-white'
+          }`}
+        >
+          <ChartIcon className="h-4 w-4" />
+          <span>กราฟ & ไทม์ไลน์</span>
+        </button>
+      </nav>
     </div>
   );
 }
