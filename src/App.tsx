@@ -5,7 +5,7 @@ import {
   Lock, Wind, Snowflake, SunDim, Sparkles, 
   Moon, Clock, ChevronUp, ChevronDown, CheckCircle2,
   LineChart as ChartIcon, Sliders, Activity, RefreshCw, 
-  ChevronLeft, ChevronRight, Loader2
+  Loader2
 } from 'lucide-react';
 
 interface ACState {
@@ -69,7 +69,6 @@ export default function App() {
   });
   
   const [inBedDurationMins, setInBedDurationMins] = useState<number>(0);
-  const [lastSession, setLastSession] = useState<SleepSession | null>(null);
 
   // ประวัติจากฐานข้อมูลจริง
   const [historyLogs, setHistoryLogs] = useState<SensorLog[]>([]);
@@ -137,7 +136,6 @@ export default function App() {
 
     if (sessions && sessions.length > 0) {
       setSleepSessions(sessions);
-      setLastSession(sessions[0]);
     }
     setRefreshing(false);
   };
@@ -239,10 +237,9 @@ export default function App() {
       };
 
       const { data } = await supabase.from('sleep_sessions').insert([newSession]).select().single();
-      if (data) {
-        setLastSession(data);
-        setSleepSessions(prev => [data, ...prev]);
-      }
+        if (data) {
+          setSleepSessions(prev => [data, ...prev]);
+        }
     }
   };
 
