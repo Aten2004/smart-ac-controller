@@ -6,7 +6,7 @@ import {
   Moon, Clock, ChevronUp, ChevronDown, CheckCircle2,
   LineChart as ChartIcon, Sliders, Activity, RefreshCw, 
   Loader2, Copy, Check, Timer as TimerIcon, Trash2, 
-  Table as TableIcon, Calendar
+  Table as TableIcon, Calendar, Smartphone
 } from 'lucide-react';
 
 interface ACState {
@@ -17,6 +17,8 @@ interface ACState {
   fan_speed: string;
   is_auto: boolean;
   last_command_code: string;
+  is_sleeping?: boolean;
+  sleep_started_at?: string | null;
   session_started_at?: string | null;
   updated_at?: string;
   timer_target_at?: string | null;
@@ -498,7 +500,6 @@ export default function App() {
     }
   };
 
-  // ปรับเกณฑ์ Healthy Zone ให้ตรงกับช่วงนอนจริง (23-26°C, 50-62%RH)
   const stats = useMemo(() => {
     if (historyLogs.length === 0) {
       return { minT: null, maxT: null, avgT: null, minH: null, maxH: null, avgH: null, optimalPercent: 0, lastSeenMins: null };
@@ -602,6 +603,7 @@ export default function App() {
   const isOptimal = (sensor.humidity ?? 0) >= 50 && (sensor.humidity ?? 0) <= 62 && (sensor.temperature ?? 0) >= 23.0 && (sensor.temperature ?? 0) <= 26.0;
   const isDry = acState.power && acState.mode === 'dry';
   const isDehumidifyingMode = acState.power && acState.target_temp === 22 && acState.mode !== 'dry';
+  const isSleepingState = acState.power && (acState.is_sleeping ?? false);
 
   const formatTimerCountdown = (totalSec: number) => {
     const hrs = Math.floor(totalSec / 3600);
@@ -685,7 +687,6 @@ export default function App() {
               </div>
             </div>
 
-            {/* แก้ไขลำดับการประเมินสภาพอากาศให้ถูกต้อง ไม่แสดงกำลังรีดน้ำตอนแอร์ปิด */}
             <div className="flex items-center justify-between px-3 py-1.5 rounded-xl bg-slate-900/40 border border-slate-800/50 text-[11px]">
               <span className="text-slate-400">ประเมินสภาพอากาศ:</span>
               {sensor.temperature === null ? (
@@ -713,27 +714,36 @@ export default function App() {
             <div className={`absolute h-52 w-52 rounded-full blur-3xl transition-opacity duration-700 pointer-events-none ${
               !acState.power 
                 ? 'bg-transparent' 
-                : isDry
-                  ? 'bg-blue-600/25'
-                  : isDehumidifyingMode
-                    ? 'bg-blue-600/30' 
-                    : 'bg-cyan-500/25'
+                : isSleepingState
+                  ? 'bg-indigo-600/30'
+                  : isDry
+                    ? 'bg-blue-600/25'
+                    : isDehumidifyingMode
+                      ? 'bg-blue-600/30' 
+                      : 'bg-cyan-500/25'
             }`} />
 
             <div className="relative flex h-52 w-52 items-center justify-center rounded-full border border-slate-800/90 bg-slate-950/70 p-4 shadow-[inset_0_2px_12px_rgba(0,0,0,0.8)] backdrop-blur-2xl">
               <div className={`flex h-full w-full flex-col items-center justify-center rounded-full border transition-all duration-500 ${
                 !acState.power 
                   ? 'border-slate-800/60 bg-slate-900/30 text-slate-600' 
-                  : isDry
-                    ? 'border-blue-500/40 bg-gradient-to-b from-blue-950/40 to-slate-950 text-blue-300 shadow-[0_0_30px_rgba(59,130,246,0.25)]'
-                    : isDehumidifyingMode
-                      ? 'border-teal-500/40 bg-gradient-to-b from-teal-950/40 to-slate-950 text-teal-300 shadow-[0_0_30px_rgba(20,184,166,0.25)]'
-                      : 'border-cyan-500/40 bg-gradient-to-b from-cyan-950/40 to-slate-950 text-cyan-300 shadow-[0_0_30px_rgba(6,182,212,0.2)]'
+                  : isSleepingState
+                    ? 'border-indigo-500/50 bg-gradient-to-b from-indigo-950/40 to-slate-950 text-indigo-300 shadow-[0_0_30px_rgba(99,102,241,0.25)]'
+                    : isDry
+                      ? 'border-blue-500/40 bg-gradient-to-b from-blue-950/40 to-slate-950 text-blue-300 shadow-[0_0_30px_rgba(59,130,246,0.25)]'
+                      : isDehumidifyingMode
+                        ? 'border-teal-500/40 bg-gradient-to-b from-teal-950/40 to-slate-950 text-teal-300 shadow-[0_0_30px_rgba(20,184,166,0.25)]'
+                        : 'border-cyan-500/40 bg-gradient-to-b from-cyan-950/40 to-slate-950 text-cyan-300 shadow-[0_0_30px_rgba(6,182,212,0.2)]'
               }`}>
                 {acState.power ? (
                   <>
                     <div className="flex items-center gap-1.5 text-xs font-semibold uppercase tracking-widest text-slate-400 mb-1">
-                      {isDry ? (
+                      {isSleepingState ? (
+                        <>
+                          <Moon className="h-3.5 w-3.5 text-indigo-400 animate-pulse" />
+                          <span className="text-indigo-300">Deep Sleep Curve</span>
+                        </>
+                      ) : isDry ? (
                         <>
                           <Droplets className="h-3.5 w-3.5 text-blue-400" />
                           <span className="text-blue-300">Dry Mode</span>
@@ -772,19 +782,41 @@ export default function App() {
               </div>
             </div>
 
+            {/* Smart Realtime Sleep Badge & Manual Override */}
             {acState.power && (
-              <div className="mt-2 flex items-center gap-2 px-3.5 py-1 rounded-full bg-slate-900/80 border border-slate-800 text-xs text-slate-300">
-                <Moon className="h-3.5 w-3.5 text-cyan-400" />
-                <span>เข้าห้องนอนแล้ว: <strong>{formatInBedDuration(inBedDurationMins)}</strong></span>
-                {inBedDurationMins >= MIN_SLEEP_THRESHOLD_MINS ? (
-                  <span className="text-[10px] text-emerald-400 bg-emerald-500/10 px-2 py-0.5 rounded-full border border-emerald-500/20">
-                    บันทึกการนอนจริง
-                  </span>
-                ) : (
-                  <span className="text-[10px] text-amber-400 bg-amber-500/10 px-2 py-0.5 rounded-full border border-amber-500/20">
-                    ช่วงวอร์ม (15 น.)
-                  </span>
-                )}
+              <div className="mt-2.5 flex flex-col items-center gap-1.5">
+                <button
+                  onClick={() => updateState({ is_sleeping: !(acState.is_sleeping ?? false) })}
+                  className={`flex items-center gap-2 px-3.5 py-1.5 rounded-full border text-xs font-medium transition active:scale-95 ${
+                    isSleepingState
+                      ? 'bg-indigo-500/15 border-indigo-500/40 text-indigo-300 shadow-[0_0_14px_rgba(99,102,241,0.2)]'
+                      : 'bg-slate-900/80 border-slate-800 text-slate-400 hover:text-slate-200'
+                  }`}
+                >
+                  {isSleepingState ? (
+                    <>
+                      <Moon className="h-3.5 w-3.5 text-indigo-400" />
+                      <span>สถานะ: <strong>วางมือถือนอนแล้ว</strong></span>
+                      <span className="text-[10px] text-indigo-300 bg-indigo-500/20 px-2 py-0.5 rounded-full border border-indigo-500/30">
+                        Sleeping
+                      </span>
+                    </>
+                  ) : (
+                    <>
+                      <Smartphone className="h-3.5 w-3.5 text-amber-400" />
+                      <span>สถานะ: <strong>ตื่น / ใช้มือถือ</strong></span>
+                      <span className="text-[10px] text-amber-300 bg-amber-500/20 px-2 py-0.5 rounded-full border border-amber-500/30">
+                        Awake
+                      </span>
+                    </>
+                  )}
+                </button>
+
+                <div className="text-[10px] text-slate-500 flex items-center gap-1">
+                  <span>เปิดแอร์มาแล้ว: {formatInBedDuration(inBedDurationMins)}</span>
+                  <span>•</span>
+                  <span>แตะเพื่อสลับโหมดนอน/ตื่น</span>
+                </div>
               </div>
             )}
           </div>
@@ -1007,7 +1039,6 @@ export default function App() {
               </button>
             </div>
 
-            {/* ครอบคลุมทั้งโหมด Cool, Dry เดิม, รีดน้ำด่วน 22°C และปุ่ม Power */}
             <div className="grid grid-cols-4 gap-1.5">
               <button
                 disabled={loading || !acState.power}
