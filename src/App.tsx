@@ -50,7 +50,7 @@ const MIN_SLEEP_THRESHOLD_MINS = 15;
 
 const calculateLgHex = (power: boolean, mode: string, temp: number): string => {
   if (!power) return '0x88C0051';
-  if (mode === 'dry') return '0x880194E'; // เพิ่มบรรทัดนี้เพื่อเคลียร์ TS6133 และรองรับโหมด Dry เดิม
+  if (mode === 'dry') return '0x880194E';
   const clamped = Math.min(Math.max(temp, 18), 30);
   const tempNibble = clamped - 15;
   const fanNibble = 4; // Low Fan
@@ -77,7 +77,6 @@ export default function App() {
   const [hoveredPoint, setHoveredPoint] = useState<SensorLog | null>(null);
   const [logRange, setLogRange] = useState<number>(60);
 
-  // State แผงตั้งเวลา UI
   const [showTimerCard, setShowTimerCard] = useState<boolean>(false);
   const [timerSubTab, setTimerSubTab] = useState<'countdown' | 'schedule'>('countdown');
   const [remainingSeconds, setRemainingSeconds] = useState<number>(0);
@@ -342,8 +341,6 @@ export default function App() {
         const validHums = logs.map(l => Number(l.humidity)).filter(v => !isNaN(v));
         if (validTemps.length > 0) avgT = Number((validTemps.reduce((a, b) => a + b, 0) / validTemps.length).toFixed(1));
         if (validHums.length > 0) avgH = Number((validHums.reduce((a, b) => a + b, 0) / validHums.length).toFixed(1));
-        
-        // นับทั้ง deep_cool และ dry
         dryCount = logs.filter(l => l.ac_mode === 'deep_cool' || l.ac_mode === 'dry').length;
       }
 
@@ -501,7 +498,7 @@ export default function App() {
     }
   };
 
-  // ปรับเกณฑ์คำนวณ Healthy Zone ให้ตรงกับช่วงนอนจริง (23-26°C, 50-62%RH)
+  // ปรับเกณฑ์ Healthy Zone ให้ตรงกับช่วงนอนจริง (23-26°C, 50-62%RH)
   const stats = useMemo(() => {
     if (historyLogs.length === 0) {
       return { minT: null, maxT: null, avgT: null, minH: null, maxH: null, avgH: null, optimalPercent: 0, lastSeenMins: null };
@@ -601,9 +598,10 @@ export default function App() {
     );
   }
 
-  const isHighHumidity = (sensor.humidity ?? 0) >= 65.0;
+  const isHighHumidity = (sensor.humidity ?? 0) >= 64.0;
   const isOptimal = (sensor.humidity ?? 0) >= 50 && (sensor.humidity ?? 0) <= 62 && (sensor.temperature ?? 0) >= 23.0 && (sensor.temperature ?? 0) <= 26.0;
-  const isDehumidifyingMode = acState.power && acState.target_temp === 22;
+  const isDry = acState.power && acState.mode === 'dry';
+  const isDehumidifyingMode = acState.power && acState.target_temp === 22 && acState.mode !== 'dry';
 
   const formatTimerCountdown = (totalSec: number) => {
     const hrs = Math.floor(totalSec / 3600);
@@ -687,16 +685,21 @@ export default function App() {
               </div>
             </div>
 
+            {/* แก้ไขลำดับการประเมินสภาพอากาศให้ถูกต้อง ไม่แสดงกำลังรีดน้ำตอนแอร์ปิด */}
             <div className="flex items-center justify-between px-3 py-1.5 rounded-xl bg-slate-900/40 border border-slate-800/50 text-[11px]">
               <span className="text-slate-400">ประเมินสภาพอากาศ:</span>
               {sensor.temperature === null ? (
                 <span className="text-slate-500">รอรับสัญญาณสดจาก DHT22...</span>
+              ) : !acState.power ? (
+                <span className="text-slate-400 font-medium">ความชื้นตามสภาพห้อง (แอร์ปิดอยู่)</span>
+              ) : isDehumidifyingMode ? (
+                <span className="text-cyan-400 font-semibold animate-pulse">กำลังเร่งรีดน้ำ (Deep Cool 22°C)</span>
               ) : isOptimal ? (
                 <span className="text-emerald-400 font-semibold flex items-center gap-1">
                   <CheckCircle2 className="h-3 w-3" /> สบายตัว อุณหภูมิ & ความชื้นสมดุล
                 </span>
               ) : isHighHumidity ? (
-                <span className="text-rose-400 font-semibold">ชื้นสะสมสูง ระบบกำลังเร่งรีดน้ำ</span>
+                <span className="text-rose-400 font-semibold">ชื้นสะสมสูง ระบบกำลังเฝ้าระวังรีดน้ำ</span>
               ) : (sensor.humidity ?? 0) < 50 ? (
                 <span className="text-amber-400 font-semibold">อากาศแห้ง เสี่ยงผิวแห้งคัน</span>
               ) : (
@@ -710,26 +713,35 @@ export default function App() {
             <div className={`absolute h-52 w-52 rounded-full blur-3xl transition-opacity duration-700 pointer-events-none ${
               !acState.power 
                 ? 'bg-transparent' 
-                : isDehumidifyingMode
-                  ? 'bg-blue-600/30' 
-                  : 'bg-cyan-500/25'
+                : isDry
+                  ? 'bg-blue-600/25'
+                  : isDehumidifyingMode
+                    ? 'bg-blue-600/30' 
+                    : 'bg-cyan-500/25'
             }`} />
 
             <div className="relative flex h-52 w-52 items-center justify-center rounded-full border border-slate-800/90 bg-slate-950/70 p-4 shadow-[inset_0_2px_12px_rgba(0,0,0,0.8)] backdrop-blur-2xl">
               <div className={`flex h-full w-full flex-col items-center justify-center rounded-full border transition-all duration-500 ${
                 !acState.power 
                   ? 'border-slate-800/60 bg-slate-900/30 text-slate-600' 
-                  : isDehumidifyingMode
+                  : isDry
                     ? 'border-blue-500/40 bg-gradient-to-b from-blue-950/40 to-slate-950 text-blue-300 shadow-[0_0_30px_rgba(59,130,246,0.25)]'
-                    : 'border-cyan-500/40 bg-gradient-to-b from-cyan-950/40 to-slate-950 text-cyan-300 shadow-[0_0_30px_rgba(6,182,212,0.2)]'
+                    : isDehumidifyingMode
+                      ? 'border-teal-500/40 bg-gradient-to-b from-teal-950/40 to-slate-950 text-teal-300 shadow-[0_0_30px_rgba(20,184,166,0.25)]'
+                      : 'border-cyan-500/40 bg-gradient-to-b from-cyan-950/40 to-slate-950 text-cyan-300 shadow-[0_0_30px_rgba(6,182,212,0.2)]'
               }`}>
                 {acState.power ? (
                   <>
                     <div className="flex items-center gap-1.5 text-xs font-semibold uppercase tracking-widest text-slate-400 mb-1">
-                      {isDehumidifyingMode ? (
+                      {isDry ? (
                         <>
-                          <Droplets className="h-3.5 w-3.5 text-blue-400 animate-bounce" />
-                          <span className="text-blue-300">Deep Dehumidify</span>
+                          <Droplets className="h-3.5 w-3.5 text-blue-400" />
+                          <span className="text-blue-300">Dry Mode</span>
+                        </>
+                      ) : isDehumidifyingMode ? (
+                        <>
+                          <Droplets className="h-3.5 w-3.5 text-teal-400 animate-bounce" />
+                          <span className="text-teal-300">Deep Dehumidify</span>
                         </>
                       ) : (
                         <>
@@ -741,9 +753,9 @@ export default function App() {
                     
                     <div className="flex items-baseline justify-center">
                       <span className="text-5xl font-extrabold tracking-tighter text-white">
-                        {acState.target_temp}
+                        {isDry ? '--' : acState.target_temp}
                       </span>
-                      <span className="text-xl font-light text-slate-400 ml-1">°C</span>
+                      {!isDry && <span className="text-xl font-light text-slate-400 ml-1">°C</span>}
                     </div>
 
                     <div className="mt-2 flex items-center gap-1.5 text-[11px] font-medium text-slate-400 bg-slate-900/80 px-2.5 py-1 rounded-full border border-slate-800">
@@ -964,7 +976,7 @@ export default function App() {
                 disabled={loading}
                 onClick={() => updateState({ power: true, target_temp: 24, mode: 'cool' })}
                 className={`py-3 px-2 rounded-2xl border text-xs font-semibold flex flex-col items-center justify-center gap-1 transition active:scale-95 ${
-                  acState.power && acState.target_temp === 24
+                  acState.power && acState.target_temp === 24 && acState.mode !== 'dry'
                     ? 'bg-cyan-500 text-slate-950 border-cyan-400 shadow-[0_0_12px_rgba(6,182,212,0.3)]'
                     : 'bg-slate-900/70 border-slate-800 text-slate-400 hover:text-slate-200 disabled:opacity-30'
                 }`}
@@ -977,7 +989,7 @@ export default function App() {
                 disabled={loading}
                 onClick={() => updateState({ power: true, target_temp: 25, mode: 'cool' })}
                 className={`py-3 px-2 rounded-2xl border text-xs font-semibold flex flex-col items-center justify-center gap-1 transition active:scale-95 ${
-                  acState.power && acState.target_temp === 25
+                  acState.power && acState.target_temp === 25 && acState.mode !== 'dry'
                     ? 'bg-cyan-500 text-slate-950 border-cyan-400 shadow-[0_0_12px_rgba(6,182,212,0.3)]'
                     : 'bg-slate-900/70 border-slate-800 text-slate-400 hover:text-slate-200 disabled:opacity-30'
                 }`}
@@ -995,41 +1007,58 @@ export default function App() {
               </button>
             </div>
 
-            <div className="grid grid-cols-3 gap-2">
+            {/* ครอบคลุมทั้งโหมด Cool, Dry เดิม, รีดน้ำด่วน 22°C และปุ่ม Power */}
+            <div className="grid grid-cols-4 gap-1.5">
               <button
                 disabled={loading || !acState.power}
-                onClick={() => updateState({ mode: 'cool' })}
-                className="py-3 rounded-2xl border text-xs font-semibold flex flex-col items-center justify-center gap-1.5 transition active:scale-95 bg-cyan-500/20 border-cyan-500/50 text-cyan-300"
+                onClick={() => updateState({ mode: 'cool', target_temp: 24 })}
+                className={`py-2.5 rounded-2xl border text-[11px] font-semibold flex flex-col items-center justify-center gap-1 transition active:scale-95 ${
+                  acState.power && acState.mode === 'cool' && acState.target_temp !== 22
+                    ? 'bg-cyan-500/20 border-cyan-500/50 text-cyan-300'
+                    : 'bg-slate-900/70 border-slate-800 text-slate-400 disabled:opacity-30'
+                }`}
               >
-                <Snowflake className="h-4 w-4" />
-                Cooling
+                <Snowflake className="h-3.5 w-3.5" />
+                Cool
               </button>
 
-              {/* ปุ่มรีดน้ำด่วน 22°C (แทนที่ปุ่ม Dry เดิม) */}
               <button
                 disabled={loading || !acState.power}
-                onClick={() => updateState({ power: true, target_temp: 22, mode: 'cool' })}
-                className={`py-3 rounded-2xl border text-xs font-semibold flex flex-col items-center justify-center gap-1.5 transition active:scale-95 ${
+                onClick={() => updateState({ mode: 'dry' })}
+                className={`py-2.5 rounded-2xl border text-[11px] font-semibold flex flex-col items-center justify-center gap-1 transition active:scale-95 ${
+                  isDry
+                    ? 'bg-blue-500/30 border-blue-400 text-blue-200 shadow-[0_0_12px_rgba(59,130,246,0.3)]'
+                    : 'bg-slate-900/70 border-slate-800 text-slate-400 disabled:opacity-30'
+                }`}
+              >
+                <Wind className="h-3.5 w-3.5" />
+                Dry เดิม
+              </button>
+
+              <button
+                disabled={loading || !acState.power}
+                onClick={() => updateState({ mode: 'cool', target_temp: 22 })}
+                className={`py-2.5 rounded-2xl border text-[11px] font-semibold flex flex-col items-center justify-center gap-1 transition active:scale-95 ${
                   isDehumidifyingMode
-                    ? 'bg-blue-500/30 border-blue-400 text-blue-200 shadow-[0_0_14px_rgba(59,130,246,0.3)] animate-pulse'
+                    ? 'bg-teal-500/30 border-teal-400 text-teal-200 shadow-[0_0_12px_rgba(20,184,166,0.3)] animate-pulse'
                     : 'bg-slate-900/70 border-slate-800 text-slate-400 hover:text-cyan-300 disabled:opacity-30'
                 }`}
               >
-                <Droplets className="h-4 w-4 text-cyan-400" />
-                รีดน้ำ (22°C)
+                <Droplets className="h-3.5 w-3.5 text-cyan-400" />
+                รีดน้ำ 22°
               </button>
 
               <button
                 disabled={loading}
                 onClick={() => updateState({ power: !acState.power })}
-                className={`py-3 rounded-2xl border text-xs font-semibold flex flex-col items-center justify-center gap-1.5 transition active:scale-95 ${
+                className={`py-2.5 rounded-2xl border text-[11px] font-semibold flex flex-col items-center justify-center gap-1 transition active:scale-95 ${
                   acState.power
                     ? 'bg-rose-500/20 border-rose-500/50 text-rose-400 shadow-[0_0_14px_rgba(244,63,94,0.2)]'
                     : 'bg-slate-900/80 border-slate-800 text-slate-400 hover:text-white'
                 }`}
               >
-                <Power className="h-4 w-4" />
-                {acState.power ? 'Turn OFF' : 'Turn ON'}
+                <Power className="h-3.5 w-3.5" />
+                {acState.power ? 'ปิดแอร์' : 'เปิดแอร์'}
               </button>
             </div>
 
@@ -1145,7 +1174,6 @@ export default function App() {
                     viewBox={`0 0 ${chartData.width} ${chartData.height}`} 
                     className="w-full h-full block"
                   >
-                    {/* แถบ Healthy Zone สบายตัว (50-62%RH) */}
                     <rect
                       x="0"
                       y={chartData.getYH(62)}
@@ -1156,9 +1184,9 @@ export default function App() {
                     
                     <line
                       x1="0"
-                      y1={chartData.getYH(65)}
+                      y1={chartData.getYH(64)}
                       x2={chartData.width}
-                      y2={chartData.getYH(65)}
+                      y2={chartData.getYH(64)}
                       stroke="rgba(244, 63, 94, 0.4)"
                       strokeDasharray="4 4"
                       strokeWidth="1"
@@ -1197,7 +1225,6 @@ export default function App() {
                           </text>
                         )}
 
-                        {/* แสดงจุดวงกลมสีฟ้าเมื่อแอร์ทำงานในโหมด deep_cool หรือ dry */}
                         {(d.log.ac_mode === 'deep_cool' || d.log.ac_mode === 'dry') && (
                           <circle cx={d.x} cy={d.yh} r="4.5" fill="#3b82f6" stroke="#ffffff" strokeWidth="1.5" />
                         )}
