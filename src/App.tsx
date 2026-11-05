@@ -50,6 +50,7 @@ const MIN_SLEEP_THRESHOLD_MINS = 15;
 
 const calculateLgHex = (power: boolean, mode: string, temp: number): string => {
   if (!power) return '0x88C0051';
+  if (mode === 'dry') return '0x880194E'; // เพิ่มบรรทัดนี้เพื่อเคลียร์ TS6133 และรองรับโหมด Dry เดิม
   const clamped = Math.min(Math.max(temp, 18), 30);
   const tempNibble = clamped - 15;
   const fanNibble = 4; // Low Fan
