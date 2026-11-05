@@ -5,7 +5,8 @@ import {
   Lock, Wind, Snowflake, SunDim, Sparkles, 
   Moon, Clock, ChevronUp, ChevronDown, CheckCircle2,
   LineChart as ChartIcon, Sliders, Activity, RefreshCw, 
-  Loader2
+  Loader2, Copy, Check, Timer as TimerIcon, Trash2, 
+  Table as TableIcon, Calendar
 } from 'lucide-react';
 
 interface ACState {
@@ -38,11 +39,24 @@ interface SleepSession {
   dry_mode_count?: number;
 }
 
+interface ActiveTimer {
+  targetTimestamp: number;
+  action: 'turn_off' | 'turn_on_cool25';
+  totalDurationMins: number;
+}
+
+interface DailySchedule {
+  enabled: boolean;
+  startTime: string; // เช่น "20:00"
+  endTime: string;   // เช่น "10:00"
+}
+
 const PIN_KEY = 'app_pin_unlocked';
 const SYSTEM_PIN = '1234';
+const TIMER_STORAGE_KEY = 'ac_active_countdown_timer';
+const SCHEDULE_STORAGE_KEY = 'ac_daily_schedule_config';
 const MIN_SLEEP_THRESHOLD_MINS = 15;
 
-// ฟังก์ชันคำนวณรหัส LG 28-bit ตรงตามเฟิร์มแวร์ ESP32
 const calculateLgHex = (power: boolean, mode: string, temp: number): string => {
   if (!power) return '0x88C0051';
   if (mode === 'dry') return '0x880194E';
@@ -60,40 +74,149 @@ export default function App() {
   const [loading, setLoading] = useState<boolean>(false);
   const [refreshing, setRefreshing] = useState<boolean>(false);
 
-  // สถานะแอร์: ซิงก์ตรงกับ Supabase (ไม่มี Mock Data)
   const [acState, setAcState] = useState<ACState | null>(null);
-  
-  // สถานะเซนเซอร์ DHT22 สดจาก Supabase
   const [sensor, setSensor] = useState<{ temperature: number | null; humidity: number | null }>({ 
     temperature: null, 
     humidity: null 
   });
   
   const [inBedDurationMins, setInBedDurationMins] = useState<number>(0);
-
-  // ข้อมูลจริงจาก sensor_logs และ sleep_sessions
   const [historyLogs, setHistoryLogs] = useState<SensorLog[]>([]);
   const [sleepSessions, setSleepSessions] = useState<SleepSession[]>([]);
   const [hoveredPoint, setHoveredPoint] = useState<SensorLog | null>(null);
-  const [logRange, setLogRange] = useState<number>(60); // 60 นาทีล่าสุด
+  const [logRange, setLogRange] = useState<number>(60);
 
-  // Ref สำหรับล็อกสิทธิ์คำสั่งผู้ใช้ (ป้องกันบอร์ดส่งค่าเก่ามาทับ)
+  // ======================= STATE: ตัวตั้งเวลา (TIMER & SCHEDULE) =======================
+  const [showTimerCard, setShowTimerCard] = useState<boolean>(false);
+  const [timerSubTab, setTimerSubTab] = useState<'countdown' | 'schedule'>('countdown');
+  
+  // 1. Countdown State
+  const [activeTimer, setActiveTimer] = useState<ActiveTimer | null>(null);
+  const [remainingSeconds, setRemainingSeconds] = useState<number>(0);
+  const [customTimerMinutes, setCustomTimerMinutes] = useState<string>('30');
+
+  // 2. Schedule State (เช่น 20:00 ถึง 10:00)
+  const [schedule, setSchedule] = useState<DailySchedule>({
+    enabled: false,
+    startTime: '20:00',
+    endTime: '10:00'
+  });
+  const lastScheduleStateRef = useRef<boolean | null>(null);
+
+  // State สำหรับ Copy ตาราง & แสดงตาราง
+  const [copiedData, setCopiedData] = useState<boolean>(false);
+  const [showRawTable, setShowRawTable] = useState<boolean>(false);
+
   const manualOverrideLockUntil = useRef<number>(0);
-
-  // Ref สำหรับเลื่อนกราฟแนวนอน
   const chartScrollRef = useRef<HTMLDivElement>(null);
-
-  // Touch handlers สำหรับ Swipe สลับหน้าจอ
   const touchStartX = useRef<number | null>(null);
   const touchEndX = useRef<number | null>(null);
 
+  // โหลดค่าเริ่มต้นและตรวจสอบ Storage
   useEffect(() => {
     if (localStorage.getItem(PIN_KEY) === 'true') {
       setIsAuthenticated(true);
     }
+
+    // โหลด Countdown Timer
+    const savedTimer = localStorage.getItem(TIMER_STORAGE_KEY);
+    if (savedTimer) {
+      try {
+        const parsed: ActiveTimer = JSON.parse(savedTimer);
+        if (parsed.targetTimestamp > Date.now()) {
+          setActiveTimer(parsed);
+        } else {
+          localStorage.removeItem(TIMER_STORAGE_KEY);
+        }
+      } catch (e) {
+        localStorage.removeItem(TIMER_STORAGE_KEY);
+      }
+    }
+
+    // โหลด Daily Schedule
+    const savedSchedule = localStorage.getItem(SCHEDULE_STORAGE_KEY);
+    if (savedSchedule) {
+      try {
+        setSchedule(JSON.parse(savedSchedule));
+      } catch (e) {
+        console.error('Failed to parse schedule config');
+      }
+    }
   }, []);
 
-  // ตัวนับเวลาเปิดแอร์จริงในห้อง
+  // ระบบตรวจจับเวลารายนาทีสำหรับ Daily Schedule
+  useEffect(() => {
+    if (!schedule.enabled) {
+      lastScheduleStateRef.current = null;
+      return;
+    }
+
+    const checkScheduleWindow = async () => {
+      const now = new Date();
+      const currentMins = now.getHours() * 60 + now.getMinutes();
+
+      const [startH, startM] = schedule.startTime.split(':').map(Number);
+      const [endH, endM] = schedule.endTime.split(':').map(Number);
+      const startMins = startH * 60 + startM;
+      const endMins = endH * 60 + endM;
+
+      // ตรวจสอบว่าเวลาปัจจุบันอยู่ในช่วงที่ต้องเปิดแอร์หรือไม่ (รองรับข้ามเที่ยงคืน)
+      let isInsideWindow = false;
+      if (startMins < endMins) {
+        isInsideWindow = currentMins >= startMins && currentMins < endMins;
+      } else {
+        isInsideWindow = currentMins >= startMins || currentMins < endMins;
+      }
+
+      // ทำงานเฉพาะเมื่อเกิดการเปลี่ยนสถานะเข้าหรือออกจากช่วงเวลา (Trigger on Edge)
+      if (lastScheduleStateRef.current !== isInsideWindow) {
+        lastScheduleStateRef.current = isInsideWindow;
+        if (isInsideWindow) {
+          // ถึงเวลาเปิดแอร์ (เช่น 20:00)
+          console.log('[SCHEDULE] Entering active window -> Auto Turn ON Cool 25°C');
+          await updateState({ power: true, mode: 'cool', target_temp: 25 });
+        } else {
+          // หมดเวลา (เช่น 10:00)
+          console.log('[SCHEDULE] Exiting active window -> Auto Turn OFF');
+          await updateState({ power: false });
+        }
+      }
+    };
+
+    checkScheduleWindow();
+    const interval = setInterval(checkScheduleWindow, 15000); // ตรวจสอบทุก 15 วินาที
+    return () => clearInterval(interval);
+  }, [schedule, acState]);
+
+  // ตัวนับถอยหลัง Countdown Timer
+  useEffect(() => {
+    if (!activeTimer) {
+      setRemainingSeconds(0);
+      return;
+    }
+
+    const checkTimer = async () => {
+      const now = Date.now();
+      const diffMs = activeTimer.targetTimestamp - now;
+      if (diffMs <= 0) {
+        if (activeTimer.action === 'turn_off') {
+          await updateState({ power: false });
+        } else {
+          await updateState({ power: true, mode: 'cool', target_temp: 25 });
+        }
+        setActiveTimer(null);
+        localStorage.removeItem(TIMER_STORAGE_KEY);
+      } else {
+        setRemainingSeconds(Math.ceil(diffMs / 1000));
+      }
+    };
+
+    checkTimer();
+    const timerInterval = setInterval(checkTimer, 1000);
+    return () => clearInterval(timerInterval);
+  }, [activeTimer]);
+
+  // ตัวนับเวลาการนอน
   useEffect(() => {
     if (!acState || !acState.power) {
       setInBedDurationMins(0);
@@ -113,7 +236,6 @@ export default function App() {
     return () => clearInterval(interval);
   }, [acState]);
 
-  // ดึงข้อมูลวิเคราะห์ทั้งหมดจาก Supabase
   const fetchAnalyticsData = async () => {
     setRefreshing(true);
     try {
@@ -166,21 +288,16 @@ export default function App() {
 
     fetchInitial();
 
-    // ฟัง Realtime การควบคุมแอร์ (พร้อม Grace Period Guard)
     const acChannel = supabase
       .channel('realtime_ac_control')
       .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'ac_control' }, (payload) => {
-        // หากผู้ใช้เพิ่งกดปุ่มไม่เกิน 6 วินาที ให้ข้ามข้อมูลเก่าที่บอร์ดอาจเพิ่งยิงขึ้นมา
-        if (Date.now() < manualOverrideLockUntil.current) {
-          return;
-        }
+        if (Date.now() < manualOverrideLockUntil.current) return;
         if (payload.new && (payload.new as ACState).id === 1) {
           setAcState(payload.new as ACState);
         }
       })
       .subscribe();
 
-    // ฟัง Realtime ข้อมูลเซนเซอร์จาก ESP32
     const sensorChannel = supabase
       .channel('realtime_sensor_logs')
       .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'sensor_logs' }, (payload) => {
@@ -207,7 +324,6 @@ export default function App() {
     };
   }, [isAuthenticated, logRange]);
 
-  // เลื่อนกราฟไปทางขวาสุด (จุดเวลาล่าสุด) เมื่อโหลดข้อมูลเสร็จ
   useEffect(() => {
     if (currentTab === 'analytics' && chartScrollRef.current) {
       setTimeout(() => {
@@ -272,17 +388,12 @@ export default function App() {
     }
   };
 
-  // จัดการอัปเดตสถานะแบบ Single Source of Truth พร้อม Auto-Disarm
   const updateState = async (updates: Partial<ACState>) => {
     if (!acState) return;
     setLoading(true);
-
-    // ล็อกสิทธิ์หน้าจอไว้ 6 วินาที เพื่อไม่ให้ Realtime จากบอร์ดมาเด้งทับ
     manualOverrideLockUntil.current = Date.now() + 6000;
 
-    // ตรวจสอบว่าเป็นการกดปุ่มสลับ Auto Guard ตรงๆ หรือเกิดจากการกดสั่งแอร์ทั่วไป
     const isExplicitAutoToggle = updates.is_auto !== undefined && Object.keys(updates).length === 1;
-    // หากเป็นการกดสั่งแอร์ทั่วไป ให้บังคับปลด Auto Guard ทิ้ง (is_auto = false) ทันที
     const nextAuto = isExplicitAutoToggle ? updates.is_auto! : false;
 
     const nextPower = updates.power !== undefined ? updates.power : acState.power;
@@ -315,7 +426,6 @@ export default function App() {
       updated_at: new Date().toISOString()
     };
 
-    // อัปเดตหน้าจอทันที (Optimistic UI)
     setAcState((prev) => prev ? ({ ...prev, ...payload }) : null);
 
     try {
@@ -327,7 +437,56 @@ export default function App() {
     }
   };
 
-  // ตรวจจับท่าทาง Swipe สลับแท็บบนหน้าจอมือถือ
+  // เริ่มนับถอยหลัง (ล็อก Action อัตโนมัติตามสถานะแอร์)
+  const handleStartCountdown = (mins: number) => {
+    if (mins <= 0 || !acState) return;
+    // ล็อกค่าฉลาด: ถ้าแอร์เปิดอยู่ -> ล็อกเป็นปิด, ถ้าแอร์ปิดอยู่ -> ล็อกเป็นเปิด
+    const autoAction: 'turn_off' | 'turn_on_cool25' = acState.power ? 'turn_off' : 'turn_on_cool25';
+    const target = Date.now() + mins * 60 * 1000;
+    const newTimer: ActiveTimer = {
+      targetTimestamp: target,
+      action: autoAction,
+      totalDurationMins: mins
+    };
+    setActiveTimer(newTimer);
+    localStorage.setItem(TIMER_STORAGE_KEY, JSON.stringify(newTimer));
+    setShowTimerCard(false);
+  };
+
+  const handleCancelCountdown = () => {
+    setActiveTimer(null);
+    localStorage.removeItem(TIMER_STORAGE_KEY);
+  };
+
+  // บันทึกการตั้งเวลา Schedule ประจำวัน
+  const handleToggleSchedule = () => {
+    const updated = { ...schedule, enabled: !schedule.enabled };
+    setSchedule(updated);
+    localStorage.setItem(SCHEDULE_STORAGE_KEY, JSON.stringify(updated));
+    lastScheduleStateRef.current = null; // รีเซ็ตสถานะเพื่อเช็กใหม่ทันที
+  };
+
+  const handleSaveScheduleTimes = (start: string, end: string) => {
+    const updated = { ...schedule, startTime: start, endTime: end };
+    setSchedule(updated);
+    localStorage.setItem(SCHEDULE_STORAGE_KEY, JSON.stringify(updated));
+    lastScheduleStateRef.current = null;
+  };
+
+  // จัดการ Copy ตารางข้อมูลเป็น TSV
+  const handleCopyTableData = () => {
+    if (historyLogs.length === 0) return;
+    const header = "เวลา\tอุณหภูมิ (°C)\tความชื้น (%RH)\tโหมดแอร์\n";
+    const rows = historyLogs.map(l => {
+      const timeStr = new Date(l.created_at).toLocaleTimeString('th-TH', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+      return `${timeStr}\t${l.temperature.toFixed(1)}\t${l.humidity.toFixed(1)}\t${l.ac_mode || 'cool'}`;
+    }).join('\n');
+
+    navigator.clipboard.writeText(header + rows);
+    setCopiedData(true);
+    setTimeout(() => setCopiedData(false), 2500);
+  };
+
   const handleTouchStart = (e: React.TouchEvent) => {
     touchStartX.current = e.targetTouches[0].clientX;
     touchEndX.current = null;
@@ -348,7 +507,6 @@ export default function App() {
     }
   };
 
-  // คำนวณสถิติจากประวัติจริง ป้องกันข้อผิดพลาด NaN
   const stats = useMemo(() => {
     if (historyLogs.length === 0) {
       return { minT: null, maxT: null, avgT: null, minH: null, maxH: null, avgH: null, optimalPercent: 0, lastSeenMins: null };
@@ -378,7 +536,6 @@ export default function App() {
     return { minT, maxT, avgT, minH, maxH, avgH, optimalPercent, lastSeenMins };
   }, [historyLogs]);
 
-  // คำนวณพิกัดกราฟ SVG แบบ Dynamic Width
   const chartData = useMemo(() => {
     if (historyLogs.length < 2) return null;
     const pointSpacing = 22;
@@ -454,6 +611,26 @@ export default function App() {
   const isHighHumidity = (sensor.humidity ?? 0) >= 62.0;
   const isOptimal = (sensor.humidity ?? 0) >= 50 && (sensor.humidity ?? 0) <= 58 && (sensor.temperature ?? 0) >= 25.0 && (sensor.temperature ?? 0) <= 26.5;
 
+  const formatTimerCountdown = (totalSec: number) => {
+    const hrs = Math.floor(totalSec / 3600);
+    const mins = Math.floor((totalSec % 3600) / 60);
+    const secs = totalSec % 60;
+    if (hrs > 0) {
+      return `${hrs.toString().padStart(2, '0')}:${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
+    }
+    return `${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
+  };
+
+  // ฟังก์ชันจัดรูปแบบเวลาเปิดแอร์: ถ้าเกิน 60 นาทีจะแปลงเป็นหน่วยชั่วโมงอัตโนมัติ
+  const formatInBedDuration = (totalMins: number) => {
+    if (totalMins < 60) {
+      return `${totalMins} นาที`;
+    }
+    const hours = Math.floor(totalMins / 60);
+    const mins = totalMins % 60;
+    return mins > 0 ? `${hours} ชม. ${mins} น.` : `${hours} ชม.`;
+  };
+
   return (
     <div 
       onTouchStart={handleTouchStart}
@@ -471,7 +648,6 @@ export default function App() {
           <p className="text-[11px] font-medium text-slate-400 tracking-wide">ห้องนอน 7.7 m² • S13LCN</p>
         </div>
 
-        {/* ปุ่มสลับโหมด Auto Guard เฉพาะจุดนี้เท่านั้นที่กดเปลี่ยนค่า is_auto ตรงๆ */}
         <button 
           disabled={loading}
           onClick={() => updateState({ is_auto: !acState.is_auto })}
@@ -488,7 +664,7 @@ export default function App() {
 
       {/* ======================= TAB 1: ควบคุมแอร์ (REMOTE CONTROL) ======================= */}
       {currentTab === 'control' && (
-        <div className="w-full max-w-md flex-1 flex flex-col justify-between py-1 animate-fadeIn">
+        <div className="w-full max-w-md flex-1 flex flex-col justify-between py-1 space-y-2 animate-fadeIn">
           {/* Room Sensor Badges */}
           <div className="space-y-2">
             <div className="grid grid-cols-2 gap-3">
@@ -542,8 +718,8 @@ export default function App() {
           </div>
 
           {/* Central Climate Ring */}
-          <div className="relative flex flex-col items-center justify-center my-auto py-2">
-            <div className={`absolute h-56 w-56 rounded-full blur-3xl transition-opacity duration-700 pointer-events-none ${
+          <div className="relative flex flex-col items-center justify-center my-auto py-1">
+            <div className={`absolute h-52 w-52 rounded-full blur-3xl transition-opacity duration-700 pointer-events-none ${
               !acState.power 
                 ? 'bg-transparent' 
                 : isDry 
@@ -551,7 +727,7 @@ export default function App() {
                   : 'bg-cyan-500/25'
             }`} />
 
-            <div className="relative flex h-56 w-56 items-center justify-center rounded-full border border-slate-800/90 bg-slate-950/70 p-4 shadow-[inset_0_2px_12px_rgba(0,0,0,0.8)] backdrop-blur-2xl">
+            <div className="relative flex h-52 w-52 items-center justify-center rounded-full border border-slate-800/90 bg-slate-950/70 p-4 shadow-[inset_0_2px_12px_rgba(0,0,0,0.8)] backdrop-blur-2xl">
               <div className={`flex h-full w-full flex-col items-center justify-center rounded-full border transition-all duration-500 ${
                 !acState.power 
                   ? 'border-slate-800/60 bg-slate-900/30 text-slate-600' 
@@ -567,10 +743,10 @@ export default function App() {
                     </div>
                     
                     <div className="flex items-baseline justify-center">
-                      <span className="text-6xl font-extrabold tracking-tighter text-white">
+                      <span className="text-5xl font-extrabold tracking-tighter text-white">
                         {isDry ? '--' : acState.target_temp}
                       </span>
-                      {!isDry && <span className="text-2xl font-light text-slate-400 ml-1">°C</span>}
+                      {!isDry && <span className="text-xl font-light text-slate-400 ml-1">°C</span>}
                     </div>
 
                     <div className="mt-2 flex items-center gap-1.5 text-[11px] font-medium text-slate-400 bg-slate-900/80 px-2.5 py-1 rounded-full border border-slate-800">
@@ -580,17 +756,18 @@ export default function App() {
                   </>
                 ) : (
                   <div className="flex flex-col items-center text-slate-500">
-                    <Power className="h-10 w-10 mb-2 stroke-[1.5]" />
-                    <span className="text-sm font-semibold tracking-wider uppercase">System OFF</span>
+                    <Power className="h-9 w-9 mb-1.5 stroke-[1.5]" />
+                    <span className="text-xs font-semibold tracking-wider uppercase">System OFF</span>
                   </div>
                 )}
               </div>
             </div>
 
+            {/* แถบแจ้งเวลานอนจริง */}
             {acState.power && (
-              <div className="mt-3 flex items-center gap-2 px-3.5 py-1.5 rounded-full bg-slate-900/80 border border-slate-800 text-xs text-slate-300">
+              <div className="mt-2 flex items-center gap-2 px-3.5 py-1 rounded-full bg-slate-900/80 border border-slate-800 text-xs text-slate-300">
                 <Moon className="h-3.5 w-3.5 text-cyan-400" />
-                <span>เข้าห้องนอนแล้ว: <strong>{inBedDurationMins} นาที</strong></span>
+                <span>เข้าห้องนอนแล้ว: <strong>{formatInBedDuration(inBedDurationMins)}</strong></span>
                 {inBedDurationMins >= MIN_SLEEP_THRESHOLD_MINS ? (
                   <span className="text-[10px] text-emerald-400 bg-emerald-500/10 px-2 py-0.5 rounded-full border border-emerald-500/20">
                     บันทึกการนอนจริง
@@ -604,8 +781,190 @@ export default function App() {
             )}
           </div>
 
-          {/* Controls พร้อมปลดล็อกปุ่ม Chill/Safe ทุกสภาวะ */}
-          <div className="space-y-2.5">
+          {/* ======================= SMART TIMER & SCHEDULER SECTION ======================= */}
+          <div className="space-y-1.5">
+            {/* ป้ายแสดงเวลานับถอยหลังที่กำลังทำงานอยู่ */}
+            {activeTimer && (
+              <div className="rounded-xl bg-cyan-950/60 border border-cyan-500/40 p-2.5 flex items-center justify-between text-xs backdrop-blur-md animate-fadeIn">
+                <div className="flex items-center gap-2">
+                  <span className="h-2 w-2 rounded-full bg-cyan-400 animate-ping" />
+                  <span className="text-slate-200">
+                    {activeTimer.action === 'turn_off' ? 'สั่งปิดแอร์ในอีก' : 'สั่งเปิดแอร์ในอีก'}:
+                  </span>
+                  <strong className="font-mono text-cyan-300 text-sm">
+                    {formatTimerCountdown(remainingSeconds)}
+                  </strong>
+                </div>
+                <button
+                  onClick={handleCancelCountdown}
+                  className="px-2 py-1 rounded-lg bg-rose-500/20 border border-rose-500/30 text-rose-300 hover:bg-rose-500/30 text-[10px] font-semibold flex items-center gap-1 active:scale-95"
+                >
+                  <Trash2 className="h-3 w-3" /> ยกเลิก
+                </button>
+              </div>
+            )}
+
+            {/* แถบเปิดแผงตั้งเวลา + สถานะ Daily Schedule */}
+            {!activeTimer && (
+              <button
+                onClick={() => setShowTimerCard(!showTimerCard)}
+                className="w-full py-2 px-3 rounded-xl bg-slate-900/60 border border-slate-800 text-slate-300 hover:text-white flex items-center justify-between text-xs font-semibold transition active:scale-[0.99]"
+              >
+                <span className="flex items-center gap-2">
+                  <TimerIcon className="h-3.5 w-3.5 text-cyan-400" />
+                  <span>ระบบตั้งเวลา (Timer & Schedule)</span>
+                  {schedule.enabled && (
+                    <span className="text-[9px] bg-emerald-500/20 text-emerald-300 border border-emerald-500/40 px-1.5 py-0.5 rounded-full">
+                      เปิด {schedule.startTime} - {schedule.endTime}
+                    </span>
+                  )}
+                </span>
+                <span className="text-[10px] text-cyan-400">
+                  {showTimerCard ? 'ซ่อน ▲' : '+ จัดการเวลา ▼'}
+                </span>
+              </button>
+            )}
+
+            {/* แผงควบคุมระบบตั้งเวลาอัจฉริยะ (Smart Scheduler Panel) */}
+            {showTimerCard && !activeTimer && (
+              <div className="rounded-2xl bg-slate-900/90 border border-slate-800 p-3 space-y-2.5 backdrop-blur-xl animate-fadeIn text-xs">
+                {/* ปุ่มสลับ 2 โหมด: นับถอยหลัง VS กำหนดช่วงเวลา */}
+                <div className="grid grid-cols-2 gap-1.5 p-1 rounded-xl bg-slate-950 border border-slate-800/80">
+                  <button
+                    onClick={() => setTimerSubTab('countdown')}
+                    className={`py-1.5 rounded-lg text-xs font-semibold flex items-center justify-center gap-1.5 transition ${
+                      timerSubTab === 'countdown'
+                        ? 'bg-cyan-500 text-slate-950 shadow-sm'
+                        : 'text-slate-400 hover:text-slate-200'
+                    }`}
+                  >
+                    <Clock className="h-3.5 w-3.5" />
+                    <span>อีกกี่นาที</span>
+                  </button>
+                  <button
+                    onClick={() => setTimerSubTab('schedule')}
+                    className={`py-1.5 rounded-lg text-xs font-semibold flex items-center justify-center gap-1.5 transition ${
+                      timerSubTab === 'schedule'
+                        ? 'bg-cyan-500 text-slate-950 shadow-sm'
+                        : 'text-slate-400 hover:text-slate-200'
+                    }`}
+                  >
+                    <Calendar className="h-3.5 w-3.5" />
+                    <span>ช่วงเวลา</span>
+                  </button>
+                </div>
+
+                {/* ================= โหมด 1: นับถอยหลัง (Smart Context Lock) ================= */}
+                {timerSubTab === 'countdown' && (
+                  <div className="space-y-2 pt-1 animate-fadeIn">
+                    {/* Badge ล็อกค่าอัตโนมัติ ไม่ต้องกดเลือกซ้ำซ้อน */}
+                    <div className={`p-2 rounded-xl border flex items-center justify-between text-[11px] ${
+                      acState.power
+                        ? 'bg-rose-500/10 border-rose-500/20 text-rose-300'
+                        : 'bg-cyan-500/10 border-cyan-500/20 text-cyan-300'
+                    }`}>
+                      <span className="flex items-center gap-1.5">
+                        <span className={`h-2 w-2 rounded-full ${acState.power ? 'bg-rose-400 animate-pulse' : 'bg-cyan-400'}`} />
+                        {acState.power ? 'แอร์กำลังเปิดอยู่' : 'แอร์ปิดอยู่'}
+                      </span>
+                      <strong className="font-semibold uppercase tracking-wider">
+                        {acState.power ? 'ล็อกเป็น: สั่งปิดแอร์' : 'ล็อกเป็น: สั่งเปิดแอร์'}
+                      </strong>
+                    </div>
+
+                    {/* ปุ่มด่วน (Preset Buttons) กดปุ๊บเริ่มนับทันที */}
+                    <div className="grid grid-cols-4 gap-1.5">
+                      {[15, 30, 60, 120].map((mins) => (
+                        <button
+                          key={mins}
+                          onClick={() => handleStartCountdown(mins)}
+                          className="py-1.5 rounded-lg bg-slate-950 border border-slate-800 text-slate-300 hover:border-cyan-500/50 hover:text-cyan-400 text-xs font-mono transition active:scale-95"
+                        >
+                          +{mins >= 60 ? `${mins / 60} ชม.` : `${mins} น.`}
+                        </button>
+                      ))}
+                    </div>
+
+                    {/* ช่องพิมพ์นาทีกำหนดเอง */}
+                    <div className="flex items-center gap-2 pt-1 border-t border-slate-800/80">
+                      <span className="text-[11px] text-slate-400">ระบุเวลา:</span>
+                      <input
+                        type="number"
+                        min="1"
+                        max="720"
+                        value={customTimerMinutes}
+                        onChange={(e) => setCustomTimerMinutes(e.target.value)}
+                        className="w-16 rounded-lg bg-slate-950 px-2 py-1 text-center font-mono text-cyan-300 border border-slate-800 focus:outline-none focus:border-cyan-500 text-xs"
+                        placeholder="30"
+                      />
+                      <span className="text-[11px] text-slate-400">นาที</span>
+                      <button
+                        onClick={() => handleStartCountdown(Number(customTimerMinutes))}
+                        className={`ml-auto px-3 py-1 rounded-lg font-bold text-xs active:scale-95 ${
+                          acState.power 
+                            ? 'bg-rose-500 text-white hover:bg-rose-400' 
+                            : 'bg-cyan-500 text-slate-950 hover:bg-cyan-400'
+                        }`}
+                      >
+                        {acState.power ? 'เริ่มนับถอยหลังปิด' : 'เริ่มนับถอยหลังเปิด'}
+                      </button>
+                    </div>
+                  </div>
+                )}
+
+                {/* ================= โหมด 2: กำหนดช่วงเวลาจริง (Schedule Range) ================= */}
+                {timerSubTab === 'schedule' && (
+                  <div className="space-y-2.5 pt-1 animate-fadeIn">
+                    <div className="flex items-center justify-between p-2 rounded-xl bg-slate-950 border border-slate-800">
+                      <div>
+                        <div className="text-[11px] font-semibold text-slate-200">เปิดระบบตั้งเวลารายวัน</div>
+                        <div className="text-[10px] text-slate-400">ทำงานอัตโนมัติทุกวันตามช่วงเวลาที่กำหนด</div>
+                      </div>
+                      <button
+                        onClick={handleToggleSchedule}
+                        className={`px-3 py-1 rounded-full text-xs font-semibold transition active:scale-95 ${
+                          schedule.enabled
+                            ? 'bg-emerald-500 text-slate-950 shadow-[0_0_8px_rgba(16,185,129,0.3)]'
+                            : 'bg-slate-800 text-slate-400'
+                        }`}
+                      >
+                        {schedule.enabled ? 'เปิดใช้งานอยู่' : 'ปิดอยู่'}
+                      </button>
+                    </div>
+
+                    {/* Inputs เวลาเริ่ม และ เวลาสิ้นสุด */}
+                    <div className="grid grid-cols-2 gap-2">
+                      <div className="p-2 rounded-xl bg-slate-950 border border-slate-800">
+                        <label className="text-[10px] text-slate-400 block mb-1">เวลาเริ่มเปิดแอร์</label>
+                        <input
+                          type="time"
+                          value={schedule.startTime}
+                          onChange={(e) => handleSaveScheduleTimes(e.target.value, schedule.endTime)}
+                          className="w-full bg-slate-900 border border-slate-800 rounded-lg p-1.5 font-mono text-cyan-300 text-xs focus:outline-none focus:border-cyan-500"
+                        />
+                      </div>
+                      <div className="p-2 rounded-xl bg-slate-950 border border-slate-800">
+                        <label className="text-[10px] text-slate-400 block mb-1">เวลาสั่งปิดแอร์</label>
+                        <input
+                          type="time"
+                          value={schedule.endTime}
+                          onChange={(e) => handleSaveScheduleTimes(schedule.startTime, e.target.value)}
+                          className="w-full bg-slate-900 border border-slate-800 rounded-lg p-1.5 font-mono text-cyan-300 text-xs focus:outline-none focus:border-cyan-500"
+                        />
+                      </div>
+                    </div>
+
+                    <p className="text-[10px] text-slate-500 italic text-center">
+                      * ระบบจะสั่งเปิดแอร์ Cool 25°C เมื่อถึงเวลา {schedule.startTime} และสั่งปิดเมื่อถึง {schedule.endTime}
+                    </p>
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+
+          {/* Controls พร้อมปลดล็อกปุ่ม Chill/Safe */}
+          <div className="space-y-2">
             <div className="grid grid-cols-4 gap-2">
               <button
                 disabled={loading || !acState.power || acState.target_temp <= 18}
@@ -615,7 +974,6 @@ export default function App() {
                 <ChevronDown className="h-5 w-5" />
               </button>
 
-              {/* 25°C Chill: กดได้ตลอดเวลา แม้จะอยู่ในโหมด Dry อยู่ */}
               <button
                 disabled={loading || !acState.power}
                 onClick={() => updateState({ target_temp: 25, mode: 'cool' })}
@@ -629,7 +987,6 @@ export default function App() {
                 25°C Chill
               </button>
 
-              {/* 26°C Safe: กดได้ตลอดเวลาเพื่อรีเซ็ตกลับจุดประหยัด */}
               <button
                 disabled={loading || !acState.power}
                 onClick={() => updateState({ target_temp: 26, mode: 'cool' })}
@@ -706,25 +1063,38 @@ export default function App() {
 
       {/* ======================= TAB 2: กราฟ & วิเคราะห์ระบบ (ANALYTICS & LOGS) ======================= */}
       {currentTab === 'analytics' && (
-        <div className="w-full max-w-md flex-1 space-y-4 py-1 overflow-y-auto pr-0.5 animate-fadeIn">
-          {/* Header Controls */}
+        <div className="w-full max-w-md flex-1 space-y-3.5 py-1 overflow-y-auto pr-0.5 animate-fadeIn">
+          {/* Header Controls & ปุ่ม Copy Data */}
           <div className="flex items-center justify-between">
             <div className="flex items-center gap-2">
               <Activity className="h-4 w-4 text-cyan-400" />
               <span className="text-xs font-bold uppercase tracking-wider text-slate-300">ประวัติสภาพอากาศจริง</span>
             </div>
 
-            <div className="flex items-center gap-2">
+            <div className="flex items-center gap-1.5">
               <select
                 value={logRange}
                 onChange={(e) => setLogRange(Number(e.target.value))}
                 className="bg-slate-900 text-slate-300 text-[11px] rounded-lg px-2 py-1 border border-slate-800 focus:outline-none"
               >
-                <option value={30}>30 นาทีล่าสุด</option>
-                <option value={60}>1 ชม. ล่าสุด</option>
-                <option value={180}>3 ชม. ล่าสุด</option>
-                <option value={360}>6 ชม. ล่าสุด</option>
+                <option value={30}>30 นาที</option>
+                <option value={60}>1 ชม.</option>
+                <option value={180}>3 ชม.</option>
+                <option value={360}>6 ชม.</option>
               </select>
+
+              {/* ปุ่ม COPY ข้อมูลตารางตามช่วงเวลาที่เลือก */}
+              <button
+                onClick={handleCopyTableData}
+                className={`flex items-center gap-1 px-2.5 py-1 rounded-lg border text-[11px] font-semibold transition active:scale-95 ${
+                  copiedData
+                    ? 'bg-emerald-500/20 border-emerald-500/50 text-emerald-300'
+                    : 'bg-cyan-500/10 border-cyan-500/30 text-cyan-400 hover:bg-cyan-500/20'
+                }`}
+              >
+                {copiedData ? <Check className="h-3 w-3" /> : <Copy className="h-3 w-3" />}
+                {copiedData ? 'คัดลอกแล้ว!' : 'Copy'}
+              </button>
 
               <button
                 onClick={fetchAnalyticsData}
@@ -769,7 +1139,7 @@ export default function App() {
             </div>
           </div>
 
-          {/* Horizontal Scrollable Interactive Chart */}
+          {/* Interactive Chart */}
           <div className="rounded-2xl bg-slate-900/80 border border-slate-800 p-3.5 backdrop-blur-xl">
             <div className="flex items-center justify-between mb-2 text-[11px]">
               <div className="flex items-center gap-3">
@@ -780,7 +1150,7 @@ export default function App() {
                   <span className="h-2 w-2 rounded-full bg-cyan-400" /> ความชื้น (%RH)
                 </span>
               </div>
-              <span className="text-[10px] text-slate-500 font-mono">เลื่อนซ้าย-ขวาเพื่อดูไทม์ไลน์ ➔</span>
+              <span className="text-[10px] text-slate-500 font-mono">เลื่อนซ้าย-ขวา ➔</span>
             </div>
 
             <div 
@@ -788,7 +1158,7 @@ export default function App() {
               onTouchStart={(e) => e.stopPropagation()}
               onTouchMove={(e) => e.stopPropagation()}
               onTouchEnd={(e) => e.stopPropagation()}
-              className="relative w-full h-52 bg-slate-950/70 rounded-xl overflow-x-auto overflow-y-hidden border border-slate-900 scrollbar-thin scrollbar-thumb-slate-800"
+              className="relative w-full h-48 bg-slate-950/70 rounded-xl overflow-x-auto overflow-y-hidden border border-slate-900 scrollbar-thin scrollbar-thumb-slate-800"
             >
               {chartData ? (
                 <div style={{ width: `${chartData.width}px` }} className="h-full relative">
@@ -796,7 +1166,6 @@ export default function App() {
                     viewBox={`0 0 ${chartData.width} ${chartData.height}`} 
                     className="w-full h-full block"
                   >
-                    {/* แถบ Healthy Humidity Zone (50 - 58 %RH) */}
                     <rect
                       x="0"
                       y={chartData.getYH(58)}
@@ -805,7 +1174,6 @@ export default function App() {
                       fill="rgba(16, 185, 129, 0.08)"
                     />
                     
-                    {/* เส้นเตือนชื้นสูงวิกฤต (62 %RH) */}
                     <line
                       x1="0"
                       y1={chartData.getYH(62)}
@@ -816,7 +1184,6 @@ export default function App() {
                       strokeWidth="1"
                     />
 
-                    {/* เส้นกราฟความชื้น (%RH) */}
                     <path
                       d={chartData.humPath}
                       fill="none"
@@ -826,7 +1193,6 @@ export default function App() {
                       strokeLinejoin="round"
                     />
 
-                    {/* เส้นกราฟอุณหภูมิ (°C) */}
                     <path
                       d={chartData.tempPath}
                       fill="none"
@@ -836,7 +1202,6 @@ export default function App() {
                       strokeLinejoin="round"
                     />
 
-                    {/* จุดบนกราฟและแกนเวลา */}
                     {chartData.dots.map((d, i) => (
                       <g key={i} className="cursor-pointer" onClick={() => setHoveredPoint(d.log)}>
                         {i % 5 === 0 && (
@@ -873,7 +1238,6 @@ export default function App() {
               )}
             </div>
 
-            {/* Tooltip เมื่อแตะจุดกราฟ */}
             {hoveredPoint ? (
               <div className="mt-2.5 rounded-xl bg-slate-950 p-2.5 border border-slate-800 flex items-center justify-between text-xs animate-fadeIn">
                 <div>
@@ -890,7 +1254,58 @@ export default function App() {
                 </div>
               </div>
             ) : (
-              <p className="mt-2 text-center text-[10px] text-slate-500">ปัดซ้าย-ขวา แล้วแตะที่จุดบนกราฟเพื่อดูเวลาที่เกิดเหตุการณ์</p>
+              <p className="mt-2 text-center text-[10px] text-slate-500">ปัดซ้าย-ขวา แตะจุดบนกราฟเพื่อดูรายละเอียดย้อนหลัง</p>
+            )}
+          </div>
+
+          {/* พรีวิวตารางข้อมูลเซนเซอร์ */}
+          <div className="rounded-2xl bg-slate-900/80 border border-slate-800 p-3.5 backdrop-blur-xl">
+            <div className="flex items-center justify-between mb-2.5">
+              <div className="flex items-center gap-2">
+                <TableIcon className="h-4 w-4 text-cyan-400" />
+                <h3 className="text-xs font-bold uppercase tracking-wider text-slate-200">
+                  ตารางข้อมูลเซนเซอร์ ({historyLogs.length} รายการ)
+                </h3>
+              </div>
+              <button
+                onClick={() => setShowRawTable(!showRawTable)}
+                className="text-[11px] text-cyan-400 hover:underline font-medium"
+              >
+                {showRawTable ? 'ย่อตาราง ▲' : 'เปิดดูตาราง ▼'}
+              </button>
+            </div>
+
+            {showRawTable && (
+              <div className="max-h-56 overflow-y-auto rounded-xl border border-slate-800 bg-slate-950/80 scrollbar-thin scrollbar-thumb-slate-800">
+                <table className="w-full text-left text-[11px] font-mono">
+                  <thead className="sticky top-0 bg-slate-900 text-slate-400 border-b border-slate-800">
+                    <tr>
+                      <th className="py-2 px-3">เวลา</th>
+                      <th className="py-2 px-2 text-amber-400">อุณหภูมิ</th>
+                      <th className="py-2 px-2 text-cyan-400">ความชื้น</th>
+                      <th className="py-2 px-3 text-right">โหมด</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-800/60 text-slate-300">
+                    {historyLogs.map((log) => (
+                      <tr key={log.id} className="hover:bg-slate-900/40">
+                        <td className="py-1.5 px-3">
+                          {new Date(log.created_at).toLocaleTimeString('th-TH', { hour: '2-digit', minute: '2-digit', second: '2-digit' })}
+                        </td>
+                        <td className="py-1.5 px-2 text-amber-300">{log.temperature.toFixed(1)}°C</td>
+                        <td className="py-1.5 px-2 text-cyan-300">{log.humidity.toFixed(1)}%</td>
+                        <td className="py-1.5 px-3 text-right uppercase">
+                          <span className={`px-1.5 py-0.5 rounded text-[9px] ${
+                            log.ac_mode === 'dry' ? 'bg-blue-500/20 text-blue-300' : 'bg-slate-800 text-slate-400'
+                          }`}>
+                            {log.ac_mode || 'cool'}
+                          </span>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
             )}
           </div>
 
@@ -928,7 +1343,7 @@ export default function App() {
               </div>
             ) : (
               <div className="py-4 text-center text-xs text-slate-500">
-                ยังไม่มีประวัติการนอนที่บันทึก (ระบบจะบันทึกเมื่อเปิดแอร์ต่อเนื่องเกิน 15 นาที)
+                ยังไม่มีประวัติการนอนที่บันทึก
               </div>
             )}
           </div>
