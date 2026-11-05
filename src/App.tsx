@@ -19,7 +19,6 @@ interface ACState {
   last_command_code: string;
   session_started_at?: string | null;
   updated_at?: string;
-  // ฟิลด์ซิงก์การตั้งเวลาข้ามเครื่องผ่าน Supabase
   timer_target_at?: string | null;
   timer_action?: 'turn_off' | 'turn_on_cool25' | null;
   schedule_enabled?: boolean;
@@ -84,7 +83,8 @@ export default function App() {
   const [remainingSeconds, setRemainingSeconds] = useState<number>(0);
   const [customTimerMinutes, setCustomTimerMinutes] = useState<string>('30');
 
-  // State ป้องกัน Edge-trigger ของ Schedule ทำงานซ้ำซ้อน
+  // Ref ป้องกันการยิงคำสั่ง Timer และ Schedule วนลูปซ้ำซ้อน
+  const isTimerProcessingRef = useRef<boolean>(false);
   const lastScheduleStateRef = useRef<boolean | null>(null);
 
   // State สำหรับ Copy ตาราง & แสดงตาราง
@@ -102,7 +102,6 @@ export default function App() {
     }
   }, []);
 
-  // ฟังก์ชันจัดรูปแบบเวลานอน: เกิน 60 นาทีแปลงเป็นหน่วยชั่วโมง
   const formatInBedDuration = (totalMins: number) => {
     if (totalMins < 60) return `${totalMins} นาที`;
     const hours = Math.floor(totalMins / 60);
@@ -110,10 +109,11 @@ export default function App() {
     return mins > 0 ? `${hours} ชม. ${mins} น.` : `${hours} ชม.`;
   };
 
-  // ตัวนับถอยหลัง Realtime Countdown (ซิงก์จาก Supabase acState.timer_target_at)
+  // ตัวนับถอยหลัง Realtime Countdown (แก้ไขจุดบั๊ก Zombie Loop)
   useEffect(() => {
     if (!acState?.timer_target_at || !acState?.timer_action) {
       setRemainingSeconds(0);
+      isTimerProcessingRef.current = false;
       return;
     }
 
@@ -121,19 +121,33 @@ export default function App() {
 
     const checkTimer = async () => {
       const diffMs = targetMs - Date.now();
+
       if (diffMs <= 0) {
-        // เวลาหมดแล้ว -> สั่งงานและเคลียร์ Timer บน Cloud เพื่อให้ทุกหน้าจอดับพร้อมกัน
+        // ดักไม่ให้ทำงานซ้ำซ้อนขณะกำลังประมวลผล
+        if (isTimerProcessingRef.current) return;
+        isTimerProcessingRef.current = true;
+
         const action = acState.timer_action;
+
+        // 1. เคลียร์ค่าบนหน้าเว็บทันที ไม่รอ Realtime เพื่อตัดลูปไม่ให้เกิดซ้ำ
+        setRemainingSeconds(0);
+        setAcState(prev => prev ? ({ ...prev, timer_target_at: null, timer_action: null }) : null);
+
+        // 2. ล้างค่าบน Supabase
         await supabase.from('ac_control').update({
           timer_target_at: null,
           timer_action: null
         }).eq('id', 1);
 
-        if (action === 'turn_off') {
-          await updateState({ power: false });
-        } else if (action === 'turn_on_cool25') {
-          await updateState({ power: true, mode: 'cool', target_temp: 25 });
+        // 3. ปฏิบัติการคำสั่งเพียงครั้งเดียวเท่านั้น (หากเวลาเพิ่งหมดไม่เกิน 2 นาที)
+        if (diffMs > -120000) {
+          if (action === 'turn_off') {
+            await updateState({ power: false, timer_target_at: null, timer_action: null });
+          } else if (action === 'turn_on_cool25') {
+            await updateState({ power: true, mode: 'cool', target_temp: 25, timer_target_at: null, timer_action: null });
+          }
         }
+        isTimerProcessingRef.current = false;
       } else {
         setRemainingSeconds(Math.ceil(diffMs / 1000));
       }
@@ -144,7 +158,7 @@ export default function App() {
     return () => clearInterval(timerInterval);
   }, [acState?.timer_target_at, acState?.timer_action]);
 
-  // ระบบตรวจจับเวลารายนาทีสำหรับ Daily Schedule (ซิงก์ข้ามเครื่อง)
+  // ระบบตรวจจับเวลารายนาทีสำหรับ Daily Schedule
   useEffect(() => {
     if (!acState?.schedule_enabled) {
       lastScheduleStateRef.current = null;
@@ -167,17 +181,13 @@ export default function App() {
       if (startMins < endMins) {
         isInsideWindow = currentMins >= startMins && currentMins < endMins;
       } else {
-        // ข้ามเที่ยงคืน เช่น 20:00 ถึง 10:00
         isInsideWindow = currentMins >= startMins || currentMins < endMins;
       }
 
-      // Edge Trigger: สั่งเฉพาะจังหวะที่แตะขอบเวลาเข้าหรือออก
       if (lastScheduleStateRef.current !== null && lastScheduleStateRef.current !== isInsideWindow) {
         if (isInsideWindow && !acState.power) {
-          console.log('[SCHEDULE] Entering window -> Turn ON Cool 25°C');
           await updateState({ power: true, mode: 'cool', target_temp: 25 });
         } else if (!isInsideWindow && acState.power) {
-          console.log('[SCHEDULE] Exiting window -> Turn OFF');
           await updateState({ power: false });
         }
       }
@@ -189,7 +199,6 @@ export default function App() {
     return () => clearInterval(interval);
   }, [acState?.schedule_enabled, acState?.schedule_start, acState?.schedule_end, acState?.power]);
 
-  // ตัวนับเวลาเปิดแอร์จริงในห้อง
   useEffect(() => {
     if (!acState || !acState.power) {
       setInBedDurationMins(0);
@@ -261,7 +270,6 @@ export default function App() {
 
     fetchInitial();
 
-    // รับ Realtime จาก Supabase (ทำให้ทั้งคอมและโทรศัพท์อัปเดตพร้อมกันทันที)
     const acChannel = supabase
       .channel('realtime_ac_control')
       .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'ac_control' }, (payload) => {
@@ -362,13 +370,14 @@ export default function App() {
     }
   };
 
+  // ฟังก์ชันอัปเดตสถานะแอร์ (แก้ไขให้รับ is_auto ได้อย่างถูกต้องแม่นยำ)
   const updateState = async (updates: Partial<ACState>) => {
     if (!acState) return;
     setLoading(true);
     manualOverrideLockUntil.current = Date.now() + 6000;
 
-    const isExplicitAutoToggle = updates.is_auto !== undefined && Object.keys(updates).length === 1;
-    const nextAuto = isExplicitAutoToggle ? updates.is_auto! : false;
+    // ถ้ามีการส่ง is_auto มาอย่างชัดเจน ให้ใช้ค่านั้นเลย ถ้าไม่ส่งมาให้ปลดเป็น false (Manual)
+    const nextAuto = updates.is_auto !== undefined ? updates.is_auto : false;
 
     const nextPower = updates.power !== undefined ? updates.power : acState.power;
     const nextMode = updates.mode !== undefined ? updates.mode : acState.mode;
@@ -411,9 +420,10 @@ export default function App() {
     }
   };
 
-  // เริ่มนับถอยหลัง: บันทึกขึ้น Supabase ทันที เพื่อให้ทุกเครื่องเริ่มนับพร้อมกัน
+  // เริ่มนับถอยหลัง
   const handleStartCountdown = async (mins: number) => {
     if (mins <= 0 || !acState) return;
+    isTimerProcessingRef.current = false;
     const autoAction: 'turn_off' | 'turn_on_cool25' = acState.power ? 'turn_off' : 'turn_on_cool25';
     const targetIso = new Date(Date.now() + mins * 60 * 1000).toISOString();
 
@@ -430,8 +440,10 @@ export default function App() {
     }).eq('id', 1);
   };
 
-  // ยกเลิกเวลานับถอยหลัง: เคลียร์ค่าบน Supabase ทุกเครื่องจะหยุดนับพร้อมกันทันที
+  // กดยกเลิกนับถอยหลัง
   const handleCancelCountdown = async () => {
+    isTimerProcessingRef.current = false;
+    setRemainingSeconds(0);
     setAcState(prev => prev ? ({
       ...prev,
       timer_target_at: null,
@@ -444,7 +456,6 @@ export default function App() {
     }).eq('id', 1);
   };
 
-  // สลับเปิด/ปิดระบบตั้งเวลารายวัน (Schedule) บน Supabase
   const handleToggleSchedule = async () => {
     if (!acState) return;
     const newEnabled = !(acState.schedule_enabled ?? false);
@@ -457,7 +468,6 @@ export default function App() {
     }).eq('id', 1);
   };
 
-  // บันทึกเวลาเริ่ม-สิ้นสุดของ Schedule บน Supabase
   const handleSaveScheduleTimes = async (start: string, end: string) => {
     if (!acState) return;
 
@@ -470,7 +480,6 @@ export default function App() {
     }).eq('id', 1);
   };
 
-  // จัดการ Copy ตารางข้อมูลเป็น TSV
   const handleCopyTableData = () => {
     if (historyLogs.length === 0) return;
     const header = "เวลา\tอุณหภูมิ (°C)\tความชื้น (%RH)\tโหมดแอร์\n";
@@ -772,9 +781,9 @@ export default function App() {
             )}
           </div>
 
-          {/* ======================= SMART TIMER & SCHEDULER (ซิงก์ข้ามเครื่อง) ======================= */}
+          {/* ======================= SMART TIMER & SCHEDULER ======================= */}
           <div className="space-y-1.5">
-            {/* แสดงเวลานับถอยหลังสด (ซิงก์ตรงจาก Supabase) */}
+            {/* แสดงเวลานับถอยหลังสด */}
             {acState.timer_target_at && (
               <div className="rounded-xl bg-cyan-950/60 border border-cyan-500/40 p-2.5 flex items-center justify-between text-xs backdrop-blur-md animate-fadeIn">
                 <div className="flex items-center gap-2">
@@ -819,7 +828,6 @@ export default function App() {
             {/* แผงควบคุมระบบตั้งเวลาอัจฉริยะ */}
             {showTimerCard && !acState.timer_target_at && (
               <div className="rounded-2xl bg-slate-900/90 border border-slate-800 p-3 space-y-2.5 backdrop-blur-xl animate-fadeIn text-xs">
-                {/* ปุ่มสลับ 2 โหมด: นับถอยหลัง VS กำหนดช่วงเวลา */}
                 <div className="grid grid-cols-2 gap-1.5 p-1 rounded-xl bg-slate-950 border border-slate-800/80">
                   <button
                     onClick={() => setTimerSubTab('countdown')}
@@ -862,7 +870,6 @@ export default function App() {
                       </strong>
                     </div>
 
-                    {/* ปุ่มด่วน Preset */}
                     <div className="grid grid-cols-4 gap-1.5">
                       {[15, 30, 60, 120].map((mins) => (
                         <button
@@ -875,7 +882,6 @@ export default function App() {
                       ))}
                     </div>
 
-                    {/* ช่องระบุนาทีเอง */}
                     <div className="flex items-center gap-2 pt-1 border-t border-slate-800/80">
                       <span className="text-[11px] text-slate-400">ระบุเวลา:</span>
                       <input
@@ -952,7 +958,7 @@ export default function App() {
             )}
           </div>
 
-          {/* Controls พร้อมปลดล็อกปุ่ม Chill/Safe */}
+          {/* Controls: ปลดล็อกให้กด 25°C Chill หรือ 26°C Safe เพื่อเปิดแอร์ได้ทันทีแม้แอร์ปิดอยู่ */}
           <div className="space-y-2">
             <div className="grid grid-cols-4 gap-2">
               <button
@@ -964,8 +970,8 @@ export default function App() {
               </button>
 
               <button
-                disabled={loading || !acState.power}
-                onClick={() => updateState({ target_temp: 25, mode: 'cool' })}
+                disabled={loading}
+                onClick={() => updateState({ power: true, target_temp: 25, mode: 'cool' })}
                 className={`py-3 px-2 rounded-2xl border text-xs font-semibold flex flex-col items-center justify-center gap-1 transition active:scale-95 ${
                   acState.power && isCool && acState.target_temp === 25
                     ? 'bg-cyan-500 text-slate-950 border-cyan-400 shadow-[0_0_12px_rgba(6,182,212,0.3)]'
@@ -977,8 +983,8 @@ export default function App() {
               </button>
 
               <button
-                disabled={loading || !acState.power}
-                onClick={() => updateState({ target_temp: 26, mode: 'cool' })}
+                disabled={loading}
+                onClick={() => updateState({ power: true, target_temp: 26, mode: 'cool' })}
                 className={`py-3 px-2 rounded-2xl border text-xs font-semibold flex flex-col items-center justify-center gap-1 transition active:scale-95 ${
                   acState.power && isCool && acState.target_temp === 26
                     ? 'bg-cyan-500 text-slate-950 border-cyan-400 shadow-[0_0_12px_rgba(6,182,212,0.3)]'
@@ -1053,7 +1059,6 @@ export default function App() {
       {/* ======================= TAB 2: กราฟ & วิเคราะห์ระบบ (ANALYTICS & LOGS) ======================= */}
       {currentTab === 'analytics' && (
         <div className="w-full max-w-md flex-1 space-y-3.5 py-1 overflow-y-auto pr-0.5 animate-fadeIn">
-          {/* Header Controls & ปุ่ม Copy Data */}
           <div className="flex items-center justify-between">
             <div className="flex items-center gap-2">
               <Activity className="h-4 w-4 text-cyan-400" />
@@ -1094,7 +1099,6 @@ export default function App() {
             </div>
           </div>
 
-          {/* Metrics Grid */}
           <div className="grid grid-cols-3 gap-2">
             <div className="rounded-xl bg-slate-900/60 border border-slate-800 p-2.5 text-center">
               <div className="text-[10px] text-slate-400 uppercase font-semibold">ESP32 Status</div>
@@ -1127,7 +1131,6 @@ export default function App() {
             </div>
           </div>
 
-          {/* Interactive Chart */}
           <div className="rounded-2xl bg-slate-900/80 border border-slate-800 p-3.5 backdrop-blur-xl">
             <div className="flex items-center justify-between mb-2 text-[11px]">
               <div className="flex items-center gap-3">
@@ -1246,7 +1249,6 @@ export default function App() {
             )}
           </div>
 
-          {/* พรีวิวตารางข้อมูลเซนเซอร์ */}
           <div className="rounded-2xl bg-slate-900/80 border border-slate-800 p-3.5 backdrop-blur-xl">
             <div className="flex items-center justify-between mb-2.5">
               <div className="flex items-center gap-2">
@@ -1297,7 +1299,6 @@ export default function App() {
             )}
           </div>
 
-          {/* Timeline เซสชันการนอนจริง */}
           <div className="rounded-2xl bg-slate-900/80 border border-slate-800 p-3.5 backdrop-blur-xl">
             <div className="flex items-center gap-2 mb-3">
               <Clock className="h-4 w-4 text-cyan-400" />
