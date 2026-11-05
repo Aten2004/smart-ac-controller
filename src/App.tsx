@@ -19,6 +19,12 @@ interface ACState {
   last_command_code: string;
   session_started_at?: string | null;
   updated_at?: string;
+  // ฟิลด์ซิงก์การตั้งเวลาข้ามเครื่องผ่าน Supabase
+  timer_target_at?: string | null;
+  timer_action?: 'turn_off' | 'turn_on_cool25' | null;
+  schedule_enabled?: boolean;
+  schedule_start?: string;
+  schedule_end?: string;
 }
 
 interface SensorLog {
@@ -39,22 +45,8 @@ interface SleepSession {
   dry_mode_count?: number;
 }
 
-interface ActiveTimer {
-  targetTimestamp: number;
-  action: 'turn_off' | 'turn_on_cool25';
-  totalDurationMins: number;
-}
-
-interface DailySchedule {
-  enabled: boolean;
-  startTime: string; // เช่น "20:00"
-  endTime: string;   // เช่น "10:00"
-}
-
 const PIN_KEY = 'app_pin_unlocked';
 const SYSTEM_PIN = '1234';
-const TIMER_STORAGE_KEY = 'ac_active_countdown_timer';
-const SCHEDULE_STORAGE_KEY = 'ac_daily_schedule_config';
 const MIN_SLEEP_THRESHOLD_MINS = 15;
 
 const calculateLgHex = (power: boolean, mode: string, temp: number): string => {
@@ -86,21 +78,13 @@ export default function App() {
   const [hoveredPoint, setHoveredPoint] = useState<SensorLog | null>(null);
   const [logRange, setLogRange] = useState<number>(60);
 
-  // ======================= STATE: ตัวตั้งเวลา (TIMER & SCHEDULE) =======================
+  // State แผงตั้งเวลา UI
   const [showTimerCard, setShowTimerCard] = useState<boolean>(false);
   const [timerSubTab, setTimerSubTab] = useState<'countdown' | 'schedule'>('countdown');
-  
-  // 1. Countdown State
-  const [activeTimer, setActiveTimer] = useState<ActiveTimer | null>(null);
   const [remainingSeconds, setRemainingSeconds] = useState<number>(0);
   const [customTimerMinutes, setCustomTimerMinutes] = useState<string>('30');
 
-  // 2. Schedule State (เช่น 20:00 ถึง 10:00)
-  const [schedule, setSchedule] = useState<DailySchedule>({
-    enabled: false,
-    startTime: '20:00',
-    endTime: '10:00'
-  });
+  // State ป้องกัน Edge-trigger ของ Schedule ทำงานซ้ำซ้อน
   const lastScheduleStateRef = useRef<boolean | null>(null);
 
   // State สำหรับ Copy ตาราง & แสดงตาราง
@@ -112,100 +96,44 @@ export default function App() {
   const touchStartX = useRef<number | null>(null);
   const touchEndX = useRef<number | null>(null);
 
-  // โหลดค่าเริ่มต้นและตรวจสอบ Storage
   useEffect(() => {
     if (localStorage.getItem(PIN_KEY) === 'true') {
       setIsAuthenticated(true);
     }
-
-    // โหลด Countdown Timer
-    const savedTimer = localStorage.getItem(TIMER_STORAGE_KEY);
-    if (savedTimer) {
-      try {
-        const parsed: ActiveTimer = JSON.parse(savedTimer);
-        if (parsed.targetTimestamp > Date.now()) {
-          setActiveTimer(parsed);
-        } else {
-          localStorage.removeItem(TIMER_STORAGE_KEY);
-        }
-      } catch (e) {
-        localStorage.removeItem(TIMER_STORAGE_KEY);
-      }
-    }
-
-    // โหลด Daily Schedule
-    const savedSchedule = localStorage.getItem(SCHEDULE_STORAGE_KEY);
-    if (savedSchedule) {
-      try {
-        setSchedule(JSON.parse(savedSchedule));
-      } catch (e) {
-        console.error('Failed to parse schedule config');
-      }
-    }
   }, []);
 
-  // ระบบตรวจจับเวลารายนาทีสำหรับ Daily Schedule
+  // ฟังก์ชันจัดรูปแบบเวลานอน: เกิน 60 นาทีแปลงเป็นหน่วยชั่วโมง
+  const formatInBedDuration = (totalMins: number) => {
+    if (totalMins < 60) return `${totalMins} นาที`;
+    const hours = Math.floor(totalMins / 60);
+    const mins = totalMins % 60;
+    return mins > 0 ? `${hours} ชม. ${mins} น.` : `${hours} ชม.`;
+  };
+
+  // ตัวนับถอยหลัง Realtime Countdown (ซิงก์จาก Supabase acState.timer_target_at)
   useEffect(() => {
-    if (!schedule.enabled) {
-      lastScheduleStateRef.current = null;
-      return;
-    }
-
-    const checkScheduleWindow = async () => {
-      const now = new Date();
-      const currentMins = now.getHours() * 60 + now.getMinutes();
-
-      const [startH, startM] = schedule.startTime.split(':').map(Number);
-      const [endH, endM] = schedule.endTime.split(':').map(Number);
-      const startMins = startH * 60 + startM;
-      const endMins = endH * 60 + endM;
-
-      // ตรวจสอบว่าเวลาปัจจุบันอยู่ในช่วงที่ต้องเปิดแอร์หรือไม่ (รองรับข้ามเที่ยงคืน)
-      let isInsideWindow = false;
-      if (startMins < endMins) {
-        isInsideWindow = currentMins >= startMins && currentMins < endMins;
-      } else {
-        isInsideWindow = currentMins >= startMins || currentMins < endMins;
-      }
-
-      // ทำงานเฉพาะเมื่อเกิดการเปลี่ยนสถานะเข้าหรือออกจากช่วงเวลา (Trigger on Edge)
-      if (lastScheduleStateRef.current !== isInsideWindow) {
-        lastScheduleStateRef.current = isInsideWindow;
-        if (isInsideWindow) {
-          // ถึงเวลาเปิดแอร์ (เช่น 20:00)
-          console.log('[SCHEDULE] Entering active window -> Auto Turn ON Cool 25°C');
-          await updateState({ power: true, mode: 'cool', target_temp: 25 });
-        } else {
-          // หมดเวลา (เช่น 10:00)
-          console.log('[SCHEDULE] Exiting active window -> Auto Turn OFF');
-          await updateState({ power: false });
-        }
-      }
-    };
-
-    checkScheduleWindow();
-    const interval = setInterval(checkScheduleWindow, 15000); // ตรวจสอบทุก 15 วินาที
-    return () => clearInterval(interval);
-  }, [schedule, acState]);
-
-  // ตัวนับถอยหลัง Countdown Timer
-  useEffect(() => {
-    if (!activeTimer) {
+    if (!acState?.timer_target_at || !acState?.timer_action) {
       setRemainingSeconds(0);
       return;
     }
 
+    const targetMs = new Date(acState.timer_target_at).getTime();
+
     const checkTimer = async () => {
-      const now = Date.now();
-      const diffMs = activeTimer.targetTimestamp - now;
+      const diffMs = targetMs - Date.now();
       if (diffMs <= 0) {
-        if (activeTimer.action === 'turn_off') {
+        // เวลาหมดแล้ว -> สั่งงานและเคลียร์ Timer บน Cloud เพื่อให้ทุกหน้าจอดับพร้อมกัน
+        const action = acState.timer_action;
+        await supabase.from('ac_control').update({
+          timer_target_at: null,
+          timer_action: null
+        }).eq('id', 1);
+
+        if (action === 'turn_off') {
           await updateState({ power: false });
-        } else {
+        } else if (action === 'turn_on_cool25') {
           await updateState({ power: true, mode: 'cool', target_temp: 25 });
         }
-        setActiveTimer(null);
-        localStorage.removeItem(TIMER_STORAGE_KEY);
       } else {
         setRemainingSeconds(Math.ceil(diffMs / 1000));
       }
@@ -214,9 +142,54 @@ export default function App() {
     checkTimer();
     const timerInterval = setInterval(checkTimer, 1000);
     return () => clearInterval(timerInterval);
-  }, [activeTimer]);
+  }, [acState?.timer_target_at, acState?.timer_action]);
 
-  // ตัวนับเวลาการนอน
+  // ระบบตรวจจับเวลารายนาทีสำหรับ Daily Schedule (ซิงก์ข้ามเครื่อง)
+  useEffect(() => {
+    if (!acState?.schedule_enabled) {
+      lastScheduleStateRef.current = null;
+      return;
+    }
+
+    const checkScheduleWindow = async () => {
+      const now = new Date();
+      const currentMins = now.getHours() * 60 + now.getMinutes();
+
+      const startTime = acState.schedule_start || '20:00';
+      const endTime = acState.schedule_end || '10:00';
+
+      const [startH, startM] = startTime.split(':').map(Number);
+      const [endH, endM] = endTime.split(':').map(Number);
+      const startMins = startH * 60 + startM;
+      const endMins = endH * 60 + endM;
+
+      let isInsideWindow = false;
+      if (startMins < endMins) {
+        isInsideWindow = currentMins >= startMins && currentMins < endMins;
+      } else {
+        // ข้ามเที่ยงคืน เช่น 20:00 ถึง 10:00
+        isInsideWindow = currentMins >= startMins || currentMins < endMins;
+      }
+
+      // Edge Trigger: สั่งเฉพาะจังหวะที่แตะขอบเวลาเข้าหรือออก
+      if (lastScheduleStateRef.current !== null && lastScheduleStateRef.current !== isInsideWindow) {
+        if (isInsideWindow && !acState.power) {
+          console.log('[SCHEDULE] Entering window -> Turn ON Cool 25°C');
+          await updateState({ power: true, mode: 'cool', target_temp: 25 });
+        } else if (!isInsideWindow && acState.power) {
+          console.log('[SCHEDULE] Exiting window -> Turn OFF');
+          await updateState({ power: false });
+        }
+      }
+      lastScheduleStateRef.current = isInsideWindow;
+    };
+
+    checkScheduleWindow();
+    const interval = setInterval(checkScheduleWindow, 15000);
+    return () => clearInterval(interval);
+  }, [acState?.schedule_enabled, acState?.schedule_start, acState?.schedule_end, acState?.power]);
+
+  // ตัวนับเวลาเปิดแอร์จริงในห้อง
   useEffect(() => {
     if (!acState || !acState.power) {
       setInBedDurationMins(0);
@@ -288,6 +261,7 @@ export default function App() {
 
     fetchInitial();
 
+    // รับ Realtime จาก Supabase (ทำให้ทั้งคอมและโทรศัพท์อัปเดตพร้อมกันทันที)
     const acChannel = supabase
       .channel('realtime_ac_control')
       .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'ac_control' }, (payload) => {
@@ -437,40 +411,63 @@ export default function App() {
     }
   };
 
-  // เริ่มนับถอยหลัง (ล็อก Action อัตโนมัติตามสถานะแอร์)
-  const handleStartCountdown = (mins: number) => {
+  // เริ่มนับถอยหลัง: บันทึกขึ้น Supabase ทันที เพื่อให้ทุกเครื่องเริ่มนับพร้อมกัน
+  const handleStartCountdown = async (mins: number) => {
     if (mins <= 0 || !acState) return;
-    // ล็อกค่าฉลาด: ถ้าแอร์เปิดอยู่ -> ล็อกเป็นปิด, ถ้าแอร์ปิดอยู่ -> ล็อกเป็นเปิด
     const autoAction: 'turn_off' | 'turn_on_cool25' = acState.power ? 'turn_off' : 'turn_on_cool25';
-    const target = Date.now() + mins * 60 * 1000;
-    const newTimer: ActiveTimer = {
-      targetTimestamp: target,
-      action: autoAction,
-      totalDurationMins: mins
-    };
-    setActiveTimer(newTimer);
-    localStorage.setItem(TIMER_STORAGE_KEY, JSON.stringify(newTimer));
+    const targetIso = new Date(Date.now() + mins * 60 * 1000).toISOString();
+
+    setAcState(prev => prev ? ({
+      ...prev,
+      timer_target_at: targetIso,
+      timer_action: autoAction
+    }) : null);
     setShowTimerCard(false);
+
+    await supabase.from('ac_control').update({
+      timer_target_at: targetIso,
+      timer_action: autoAction
+    }).eq('id', 1);
   };
 
-  const handleCancelCountdown = () => {
-    setActiveTimer(null);
-    localStorage.removeItem(TIMER_STORAGE_KEY);
+  // ยกเลิกเวลานับถอยหลัง: เคลียร์ค่าบน Supabase ทุกเครื่องจะหยุดนับพร้อมกันทันที
+  const handleCancelCountdown = async () => {
+    setAcState(prev => prev ? ({
+      ...prev,
+      timer_target_at: null,
+      timer_action: null
+    }) : null);
+
+    await supabase.from('ac_control').update({
+      timer_target_at: null,
+      timer_action: null
+    }).eq('id', 1);
   };
 
-  // บันทึกการตั้งเวลา Schedule ประจำวัน
-  const handleToggleSchedule = () => {
-    const updated = { ...schedule, enabled: !schedule.enabled };
-    setSchedule(updated);
-    localStorage.setItem(SCHEDULE_STORAGE_KEY, JSON.stringify(updated));
-    lastScheduleStateRef.current = null; // รีเซ็ตสถานะเพื่อเช็กใหม่ทันที
-  };
-
-  const handleSaveScheduleTimes = (start: string, end: string) => {
-    const updated = { ...schedule, startTime: start, endTime: end };
-    setSchedule(updated);
-    localStorage.setItem(SCHEDULE_STORAGE_KEY, JSON.stringify(updated));
+  // สลับเปิด/ปิดระบบตั้งเวลารายวัน (Schedule) บน Supabase
+  const handleToggleSchedule = async () => {
+    if (!acState) return;
+    const newEnabled = !(acState.schedule_enabled ?? false);
+    
+    setAcState(prev => prev ? ({ ...prev, schedule_enabled: newEnabled }) : null);
     lastScheduleStateRef.current = null;
+
+    await supabase.from('ac_control').update({
+      schedule_enabled: newEnabled
+    }).eq('id', 1);
+  };
+
+  // บันทึกเวลาเริ่ม-สิ้นสุดของ Schedule บน Supabase
+  const handleSaveScheduleTimes = async (start: string, end: string) => {
+    if (!acState) return;
+
+    setAcState(prev => prev ? ({ ...prev, schedule_start: start, schedule_end: end }) : null);
+    lastScheduleStateRef.current = null;
+
+    await supabase.from('ac_control').update({
+      schedule_start: start,
+      schedule_end: end
+    }).eq('id', 1);
   };
 
   // จัดการ Copy ตารางข้อมูลเป็น TSV
@@ -621,15 +618,9 @@ export default function App() {
     return `${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
   };
 
-  // ฟังก์ชันจัดรูปแบบเวลาเปิดแอร์: ถ้าเกิน 60 นาทีจะแปลงเป็นหน่วยชั่วโมงอัตโนมัติ
-  const formatInBedDuration = (totalMins: number) => {
-    if (totalMins < 60) {
-      return `${totalMins} นาที`;
-    }
-    const hours = Math.floor(totalMins / 60);
-    const mins = totalMins % 60;
-    return mins > 0 ? `${hours} ชม. ${mins} น.` : `${hours} ชม.`;
-  };
+  const scheduleEnabled = acState.schedule_enabled ?? false;
+  const scheduleStart = acState.schedule_start || '20:00';
+  const scheduleEnd = acState.schedule_end || '10:00';
 
   return (
     <div 
@@ -763,7 +754,7 @@ export default function App() {
               </div>
             </div>
 
-            {/* แถบแจ้งเวลานอนจริง */}
+            {/* แถบแจ้งเวลานอนจริง (แปลงเป็น ชม. เมื่อเกิน 60 นาที) */}
             {acState.power && (
               <div className="mt-2 flex items-center gap-2 px-3.5 py-1 rounded-full bg-slate-900/80 border border-slate-800 text-xs text-slate-300">
                 <Moon className="h-3.5 w-3.5 text-cyan-400" />
@@ -781,15 +772,15 @@ export default function App() {
             )}
           </div>
 
-          {/* ======================= SMART TIMER & SCHEDULER SECTION ======================= */}
+          {/* ======================= SMART TIMER & SCHEDULER (ซิงก์ข้ามเครื่อง) ======================= */}
           <div className="space-y-1.5">
-            {/* ป้ายแสดงเวลานับถอยหลังที่กำลังทำงานอยู่ */}
-            {activeTimer && (
+            {/* แสดงเวลานับถอยหลังสด (ซิงก์ตรงจาก Supabase) */}
+            {acState.timer_target_at && (
               <div className="rounded-xl bg-cyan-950/60 border border-cyan-500/40 p-2.5 flex items-center justify-between text-xs backdrop-blur-md animate-fadeIn">
                 <div className="flex items-center gap-2">
                   <span className="h-2 w-2 rounded-full bg-cyan-400 animate-ping" />
                   <span className="text-slate-200">
-                    {activeTimer.action === 'turn_off' ? 'สั่งปิดแอร์ในอีก' : 'สั่งเปิดแอร์ในอีก'}:
+                    {acState.timer_action === 'turn_off' ? 'สั่งปิดแอร์ในอีก' : 'สั่งเปิดแอร์ในอีก'}:
                   </span>
                   <strong className="font-mono text-cyan-300 text-sm">
                     {formatTimerCountdown(remainingSeconds)}
@@ -805,7 +796,7 @@ export default function App() {
             )}
 
             {/* แถบเปิดแผงตั้งเวลา + สถานะ Daily Schedule */}
-            {!activeTimer && (
+            {!acState.timer_target_at && (
               <button
                 onClick={() => setShowTimerCard(!showTimerCard)}
                 className="w-full py-2 px-3 rounded-xl bg-slate-900/60 border border-slate-800 text-slate-300 hover:text-white flex items-center justify-between text-xs font-semibold transition active:scale-[0.99]"
@@ -813,9 +804,9 @@ export default function App() {
                 <span className="flex items-center gap-2">
                   <TimerIcon className="h-3.5 w-3.5 text-cyan-400" />
                   <span>ระบบตั้งเวลา (Timer & Schedule)</span>
-                  {schedule.enabled && (
+                  {scheduleEnabled && (
                     <span className="text-[9px] bg-emerald-500/20 text-emerald-300 border border-emerald-500/40 px-1.5 py-0.5 rounded-full">
-                      เปิด {schedule.startTime} - {schedule.endTime}
+                      เปิด {scheduleStart} - {scheduleEnd}
                     </span>
                   )}
                 </span>
@@ -825,8 +816,8 @@ export default function App() {
               </button>
             )}
 
-            {/* แผงควบคุมระบบตั้งเวลาอัจฉริยะ (Smart Scheduler Panel) */}
-            {showTimerCard && !activeTimer && (
+            {/* แผงควบคุมระบบตั้งเวลาอัจฉริยะ */}
+            {showTimerCard && !acState.timer_target_at && (
               <div className="rounded-2xl bg-slate-900/90 border border-slate-800 p-3 space-y-2.5 backdrop-blur-xl animate-fadeIn text-xs">
                 {/* ปุ่มสลับ 2 โหมด: นับถอยหลัง VS กำหนดช่วงเวลา */}
                 <div className="grid grid-cols-2 gap-1.5 p-1 rounded-xl bg-slate-950 border border-slate-800/80">
@@ -854,10 +845,9 @@ export default function App() {
                   </button>
                 </div>
 
-                {/* ================= โหมด 1: นับถอยหลัง (Smart Context Lock) ================= */}
+                {/* โหมด 1: นับถอยหลัง (Smart Context Lock) */}
                 {timerSubTab === 'countdown' && (
                   <div className="space-y-2 pt-1 animate-fadeIn">
-                    {/* Badge ล็อกค่าอัตโนมัติ ไม่ต้องกดเลือกซ้ำซ้อน */}
                     <div className={`p-2 rounded-xl border flex items-center justify-between text-[11px] ${
                       acState.power
                         ? 'bg-rose-500/10 border-rose-500/20 text-rose-300'
@@ -872,7 +862,7 @@ export default function App() {
                       </strong>
                     </div>
 
-                    {/* ปุ่มด่วน (Preset Buttons) กดปุ๊บเริ่มนับทันที */}
+                    {/* ปุ่มด่วน Preset */}
                     <div className="grid grid-cols-4 gap-1.5">
                       {[15, 30, 60, 120].map((mins) => (
                         <button
@@ -885,7 +875,7 @@ export default function App() {
                       ))}
                     </div>
 
-                    {/* ช่องพิมพ์นาทีกำหนดเอง */}
+                    {/* ช่องระบุนาทีเอง */}
                     <div className="flex items-center gap-2 pt-1 border-t border-slate-800/80">
                       <span className="text-[11px] text-slate-400">ระบุเวลา:</span>
                       <input
@@ -912,7 +902,7 @@ export default function App() {
                   </div>
                 )}
 
-                {/* ================= โหมด 2: กำหนดช่วงเวลาจริง (Schedule Range) ================= */}
+                {/* โหมด 2: กำหนดช่วงเวลาจริง (Schedule Range) */}
                 {timerSubTab === 'schedule' && (
                   <div className="space-y-2.5 pt-1 animate-fadeIn">
                     <div className="flex items-center justify-between p-2 rounded-xl bg-slate-950 border border-slate-800">
@@ -923,23 +913,22 @@ export default function App() {
                       <button
                         onClick={handleToggleSchedule}
                         className={`px-3 py-1 rounded-full text-xs font-semibold transition active:scale-95 ${
-                          schedule.enabled
+                          scheduleEnabled
                             ? 'bg-emerald-500 text-slate-950 shadow-[0_0_8px_rgba(16,185,129,0.3)]'
                             : 'bg-slate-800 text-slate-400'
                         }`}
                       >
-                        {schedule.enabled ? 'เปิดใช้งานอยู่' : 'ปิดอยู่'}
+                        {scheduleEnabled ? 'เปิดใช้งานอยู่' : 'ปิดอยู่'}
                       </button>
                     </div>
 
-                    {/* Inputs เวลาเริ่ม และ เวลาสิ้นสุด */}
                     <div className="grid grid-cols-2 gap-2">
                       <div className="p-2 rounded-xl bg-slate-950 border border-slate-800">
                         <label className="text-[10px] text-slate-400 block mb-1">เวลาเริ่มเปิดแอร์</label>
                         <input
                           type="time"
-                          value={schedule.startTime}
-                          onChange={(e) => handleSaveScheduleTimes(e.target.value, schedule.endTime)}
+                          value={scheduleStart}
+                          onChange={(e) => handleSaveScheduleTimes(e.target.value, scheduleEnd)}
                           className="w-full bg-slate-900 border border-slate-800 rounded-lg p-1.5 font-mono text-cyan-300 text-xs focus:outline-none focus:border-cyan-500"
                         />
                       </div>
@@ -947,15 +936,15 @@ export default function App() {
                         <label className="text-[10px] text-slate-400 block mb-1">เวลาสั่งปิดแอร์</label>
                         <input
                           type="time"
-                          value={schedule.endTime}
-                          onChange={(e) => handleSaveScheduleTimes(schedule.startTime, e.target.value)}
+                          value={scheduleEnd}
+                          onChange={(e) => handleSaveScheduleTimes(scheduleStart, e.target.value)}
                           className="w-full bg-slate-900 border border-slate-800 rounded-lg p-1.5 font-mono text-cyan-300 text-xs focus:outline-none focus:border-cyan-500"
                         />
                       </div>
                     </div>
 
                     <p className="text-[10px] text-slate-500 italic text-center">
-                      * ระบบจะสั่งเปิดแอร์ Cool 25°C เมื่อถึงเวลา {schedule.startTime} และสั่งปิดเมื่อถึง {schedule.endTime}
+                      * ระบบจะสั่งเปิดแอร์ Cool 25°C เมื่อถึงเวลา {scheduleStart} และสั่งปิดเมื่อถึง {scheduleEnd}
                     </p>
                   </div>
                 )}
@@ -1083,7 +1072,6 @@ export default function App() {
                 <option value={360}>6 ชม.</option>
               </select>
 
-              {/* ปุ่ม COPY ข้อมูลตารางตามช่วงเวลาที่เลือก */}
               <button
                 onClick={handleCopyTableData}
                 className={`flex items-center gap-1 px-2.5 py-1 rounded-lg border text-[11px] font-semibold transition active:scale-95 ${
