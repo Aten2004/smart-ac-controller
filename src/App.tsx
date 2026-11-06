@@ -6,7 +6,7 @@ import {
   Moon, Clock, ChevronUp, ChevronDown, CheckCircle2,
   LineChart as ChartIcon, Sliders, Activity, RefreshCw, 
   Loader2, Copy, Check, Timer as TimerIcon, Trash2, 
-  Table as TableIcon, Calendar, Smartphone, Filter
+  Table as TableIcon, Calendar, Smartphone
 } from 'lucide-react';
 
 interface ACState {
