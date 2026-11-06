@@ -6,13 +6,13 @@ import {
   Moon, Clock, ChevronUp, ChevronDown, CheckCircle2,
   LineChart as ChartIcon, Sliders, Activity, RefreshCw, 
   Loader2, Copy, Check, Timer as TimerIcon, Trash2, 
-  Table as TableIcon, Calendar, Smartphone
+  Table as TableIcon, Calendar, Smartphone, Filter
 } from 'lucide-react';
 
 interface ACState {
   id: number;
   power: boolean;
-  mode: 'cool' | 'dry' | 'off';
+  mode: 'cool' | 'dry' | 'off' | 'deep_cool';
   target_temp: number;
   fan_speed: string;
   is_auto: boolean;
@@ -79,6 +79,9 @@ export default function App() {
   const [hoveredPoint, setHoveredPoint] = useState<SensorLog | null>(null);
   const [logRange, setLogRange] = useState<number>(60);
 
+  // ตัวกรองไทม์ไลน์การนอน
+  const [sleepFilter, setSleepFilter] = useState<'recent' | 'all' | 'dehumidified'>('recent');
+
   const [showTimerCard, setShowTimerCard] = useState<boolean>(false);
   const [timerSubTab, setTimerSubTab] = useState<'countdown' | 'schedule'>('countdown');
   const [remainingSeconds, setRemainingSeconds] = useState<number>(0);
@@ -92,8 +95,6 @@ export default function App() {
 
   const manualOverrideLockUntil = useRef<number>(0);
   const chartScrollRef = useRef<HTMLDivElement>(null);
-  const touchStartX = useRef<number | null>(null);
-  const touchEndX = useRef<number | null>(null);
 
   useEffect(() => {
     if (localStorage.getItem(PIN_KEY) === 'true') {
@@ -137,7 +138,14 @@ export default function App() {
           if (action === 'turn_off') {
             await updateState({ power: false, timer_target_at: null, timer_action: null });
           } else if (action === 'turn_on_cool25') {
-            await updateState({ power: true, mode: 'cool', target_temp: 25, timer_target_at: null, timer_action: null });
+            await updateState({ 
+              power: true, 
+              mode: 'cool', 
+              target_temp: 25, 
+              is_auto: true, // เปิดโหมด Auto Guard ทันทีเมื่อนับถอยหลังเปิดเครื่อง
+              timer_target_at: null, 
+              timer_action: null 
+            });
           }
         }
         isTimerProcessingRef.current = false;
@@ -178,8 +186,13 @@ export default function App() {
 
       if (lastScheduleStateRef.current !== null && lastScheduleStateRef.current !== isInsideWindow) {
         if (isInsideWindow && !acState.power) {
-          await updateState({ power: true, mode: 'cool', target_temp: 25 });
-        } else if (!isInsideWindow && acState.power) {
+          await updateState({ 
+            power: true, 
+            mode: 'cool', 
+            target_temp: 25, 
+            is_auto: true // สั่งเปิดแอร์พร้อมเปิด Auto Guard ดูแลอุณหภูมิและความชื้นทันที
+          });
+        }else if (!isInsideWindow && acState.power) {
           await updateState({ power: false });
         }
       }
@@ -239,7 +252,7 @@ export default function App() {
         .from('sleep_sessions')
         .select('*')
         .order('started_at', { ascending: false })
-        .limit(10);
+        .limit(15);
 
       if (!sessErr && sessions) {
         setSleepSessions(sessions);
@@ -367,7 +380,7 @@ export default function App() {
     setLoading(true);
     manualOverrideLockUntil.current = Date.now() + 6000;
 
-    const nextAuto = updates.is_auto !== undefined ? updates.is_auto : false;
+    const nextAuto = updates.is_auto !== undefined ? updates.is_auto : acState.is_auto;
     const nextPower = updates.power !== undefined ? updates.power : acState.power;
     const nextMode = updates.mode !== undefined ? updates.mode : acState.mode;
     const nextTemp = updates.target_temp !== undefined ? updates.target_temp : acState.target_temp;
@@ -480,26 +493,6 @@ export default function App() {
     setTimeout(() => setCopiedData(false), 2500);
   };
 
-  const handleTouchStart = (e: React.TouchEvent) => {
-    touchStartX.current = e.targetTouches[0].clientX;
-    touchEndX.current = null;
-  };
-
-  const handleTouchMove = (e: React.TouchEvent) => {
-    touchEndX.current = e.targetTouches[0].clientX;
-  };
-
-  const handleTouchEnd = () => {
-    if (!touchStartX.current || !touchEndX.current) return;
-    const distance = touchStartX.current - touchEndX.current;
-    if (distance > 70 && currentTab === 'control') {
-      setCurrentTab('analytics');
-      fetchAnalyticsData();
-    } else if (distance < -70 && currentTab === 'analytics') {
-      setCurrentTab('control');
-    }
-  };
-
   const stats = useMemo(() => {
     if (historyLogs.length === 0) {
       return { minT: null, maxT: null, avgT: null, minH: null, maxH: null, avgH: null, optimalPercent: 0, lastSeenMins: null };
@@ -528,6 +521,16 @@ export default function App() {
 
     return { minT, maxT, avgT, minH, maxH, avgH, optimalPercent, lastSeenMins };
   }, [historyLogs]);
+
+  const filteredSessions = useMemo(() => {
+    if (sleepFilter === 'recent') {
+      return sleepSessions.slice(0, 3);
+    }
+    if (sleepFilter === 'dehumidified') {
+      return sleepSessions.filter(s => (s.dry_mode_count ?? 0) > 0);
+    }
+    return sleepSessions;
+  }, [sleepSessions, sleepFilter]);
 
   const chartData = useMemo(() => {
     if (historyLogs.length < 2) return null;
@@ -599,10 +602,10 @@ export default function App() {
     );
   }
 
-  const isHighHumidity = (sensor.humidity ?? 0) >= 64.0;
-  const isOptimal = (sensor.humidity ?? 0) >= 50 && (sensor.humidity ?? 0) <= 62 && (sensor.temperature ?? 0) >= 23.0 && (sensor.temperature ?? 0) <= 26.0;
+  const isHighHumidity = (sensor.humidity ?? 0) >= 67.0;
+  const isOptimal = (sensor.humidity ?? 0) >= 50 && (sensor.humidity ?? 0) <= 60 && (sensor.temperature ?? 0) >= 23.0 && (sensor.temperature ?? 0) <= 26.0;
   const isDry = acState.power && acState.mode === 'dry';
-  const isDehumidifyingMode = acState.power && acState.target_temp === 22 && acState.mode !== 'dry';
+  const isDehumidifyingMode = acState.power && (acState.mode === 'deep_cool' || (acState.target_temp === 22 && acState.mode !== 'dry'));
   const isSleepingState = acState.power && (acState.is_sleeping ?? false);
 
   const formatTimerCountdown = (totalSec: number) => {
@@ -620,12 +623,7 @@ export default function App() {
   const scheduleEnd = acState.schedule_end || '10:00';
 
   return (
-    <div 
-      onTouchStart={handleTouchStart}
-      onTouchMove={handleTouchMove}
-      onTouchEnd={handleTouchEnd}
-      className="min-h-[100dvh] bg-[#070b14] text-slate-100 flex flex-col items-center justify-between p-4 pb-20 font-sans select-none antialiased"
-    >
+    <div className="min-h-[100dvh] bg-[#070b14] text-slate-100 flex flex-col items-center justify-between p-4 pb-20 font-sans select-none antialiased">
       {/* 1. Header Bar */}
       <header className="w-full max-w-md flex items-center justify-between pt-1 pb-2">
         <div>
@@ -652,11 +650,11 @@ export default function App() {
 
       {/* ======================= TAB 1: ควบคุมแอร์ (REMOTE CONTROL) ======================= */}
       {currentTab === 'control' && (
-        <div className="w-full max-w-md flex-1 flex flex-col justify-between py-1 space-y-2 animate-fadeIn">
+        <div className="w-full max-w-md flex-1 flex flex-col justify-between py-1 space-y-3 animate-fadeIn">
           {/* Room Sensor Badges */}
           <div className="space-y-2">
             <div className="grid grid-cols-2 gap-3">
-              <div className="rounded-2xl bg-slate-900/60 border border-slate-800/80 p-3.5 flex items-center gap-3 backdrop-blur-md">
+              <div className="rounded-2xl bg-slate-900/60 border border-slate-800/80 p-3 flex items-center gap-3 backdrop-blur-md">
                 <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-amber-500/10 text-amber-400 border border-amber-500/20">
                   <Thermometer className="h-5 w-5" />
                 </div>
@@ -669,7 +667,7 @@ export default function App() {
                 </div>
               </div>
 
-              <div className="rounded-2xl bg-slate-900/60 border border-slate-800/80 p-3.5 flex items-center gap-3 backdrop-blur-md">
+              <div className="rounded-2xl bg-slate-900/60 border border-slate-800/80 p-3 flex items-center gap-3 backdrop-blur-md">
                 <div className={`flex h-10 w-10 items-center justify-center rounded-xl border ${
                   isHighHumidity 
                     ? 'bg-rose-500/10 text-rose-400 border-rose-500/20 animate-pulse' 
@@ -719,7 +717,7 @@ export default function App() {
                   : isDry
                     ? 'bg-blue-600/25'
                     : isDehumidifyingMode
-                      ? 'bg-blue-600/30' 
+                      ? 'bg-teal-600/30' 
                       : 'bg-cyan-500/25'
             }`} />
 
@@ -763,7 +761,7 @@ export default function App() {
                     
                     <div className="flex items-baseline justify-center">
                       <span className="text-5xl font-extrabold tracking-tighter text-white">
-                        {isDry ? '--' : acState.target_temp}
+                        {isDry ? '--' : (isDehumidifyingMode ? '22' : acState.target_temp)}
                       </span>
                       {!isDry && <span className="text-xl font-light text-slate-400 ml-1">°C</span>}
                     </div>
@@ -846,18 +844,18 @@ export default function App() {
             {!acState.timer_target_at && (
               <button
                 onClick={() => setShowTimerCard(!showTimerCard)}
-                className="w-full py-2 px-3 rounded-xl bg-slate-900/60 border border-slate-800 text-slate-300 hover:text-white flex items-center justify-between text-xs font-semibold transition active:scale-[0.99]"
+                className="w-full py-2.5 px-3.5 rounded-xl bg-slate-900/60 border border-slate-800 text-slate-300 hover:text-white flex items-center justify-between text-xs font-semibold transition active:scale-[0.99]"
               >
                 <span className="flex items-center gap-2">
                   <TimerIcon className="h-3.5 w-3.5 text-cyan-400" />
-                  <span>ระบบตั้งเวลา (Timer & Schedule)</span>
+                  <span>ระบบตั้งเวลา</span>
                   {scheduleEnabled && (
                     <span className="text-[9px] bg-emerald-500/20 text-emerald-300 border border-emerald-500/40 px-1.5 py-0.5 rounded-full">
                       เปิด {scheduleStart} - {scheduleEnd}
                     </span>
                   )}
                 </span>
-                <span className="text-[10px] text-cyan-400">
+                <span className="text-[10px] text-cyan-400 font-medium">
                   {showTimerCard ? 'ซ่อน ▲' : '+ จัดการเวลา ▼'}
                 </span>
               </button>
@@ -985,7 +983,7 @@ export default function App() {
                     </div>
 
                     <p className="text-[10px] text-slate-500 italic text-center">
-                      * ระบบจะสั่งเปิดแอร์ Cool 25°C เมื่อถึงเวลา {scheduleStart} และสั่งปิดเมื่อถึง {scheduleEnd}
+                      * ระบบจะสั่งเปิดแอร์พร้อมโหมด Auto Guard (Cool 25°C) เมื่อถึงเวลา {scheduleStart} และสั่งปิดเมื่อถึง {scheduleEnd}
                     </p>
                   </div>
                 )}
@@ -994,7 +992,7 @@ export default function App() {
           </div>
 
           {/* Quick Buttons & Controls */}
-          <div className="space-y-2">
+          <div className="space-y-2.5">
             <div className="grid grid-cols-4 gap-2">
               <button
                 disabled={loading || !acState.power || acState.target_temp <= 18}
@@ -1008,7 +1006,7 @@ export default function App() {
                 disabled={loading}
                 onClick={() => updateState({ power: true, target_temp: 24, mode: 'cool' })}
                 className={`py-3 px-2 rounded-2xl border text-xs font-semibold flex flex-col items-center justify-center gap-1 transition active:scale-95 ${
-                  acState.power && acState.target_temp === 24 && acState.mode !== 'dry'
+                  acState.power && acState.target_temp === 24 && acState.mode !== 'dry' && !isDehumidifyingMode
                     ? 'bg-cyan-500 text-slate-950 border-cyan-400 shadow-[0_0_12px_rgba(6,182,212,0.3)]'
                     : 'bg-slate-900/70 border-slate-800 text-slate-400 hover:text-slate-200 disabled:opacity-30'
                 }`}
@@ -1021,7 +1019,7 @@ export default function App() {
                 disabled={loading}
                 onClick={() => updateState({ power: true, target_temp: 25, mode: 'cool' })}
                 className={`py-3 px-2 rounded-2xl border text-xs font-semibold flex flex-col items-center justify-center gap-1 transition active:scale-95 ${
-                  acState.power && acState.target_temp === 25 && acState.mode !== 'dry'
+                  acState.power && acState.target_temp === 25 && acState.mode !== 'dry' && !isDehumidifyingMode
                     ? 'bg-cyan-500 text-slate-950 border-cyan-400 shadow-[0_0_12px_rgba(6,182,212,0.3)]'
                     : 'bg-slate-900/70 border-slate-800 text-slate-400 hover:text-slate-200 disabled:opacity-30'
                 }`}
@@ -1039,12 +1037,12 @@ export default function App() {
               </button>
             </div>
 
-            <div className="grid grid-cols-4 gap-1.5">
+            <div className="grid grid-cols-4 gap-2">
               <button
                 disabled={loading || !acState.power}
                 onClick={() => updateState({ mode: 'cool', target_temp: 24 })}
                 className={`py-2.5 rounded-2xl border text-[11px] font-semibold flex flex-col items-center justify-center gap-1 transition active:scale-95 ${
-                  acState.power && acState.mode === 'cool' && acState.target_temp !== 22
+                  acState.power && acState.mode === 'cool' && !isDehumidifyingMode
                     ? 'bg-cyan-500/20 border-cyan-500/50 text-cyan-300'
                     : 'bg-slate-900/70 border-slate-800 text-slate-400 disabled:opacity-30'
                 }`}
@@ -1091,14 +1089,6 @@ export default function App() {
                 <Power className="h-3.5 w-3.5" />
                 {acState.power ? 'ปิดแอร์' : 'เปิดแอร์'}
               </button>
-            </div>
-
-            <div className="rounded-xl bg-slate-950 border border-slate-900 px-3.5 py-1.5 flex items-center justify-between text-[10px] text-slate-400 font-mono">
-              <div className="flex items-center gap-1.5">
-                <span className="h-1.5 w-1.5 rounded-full bg-cyan-500" />
-                <span>IR: {acState.last_command_code}</span>
-              </div>
-              <span>LG 28-bit Protocol</span>
             </div>
           </div>
         </div>
@@ -1179,6 +1169,7 @@ export default function App() {
             </div>
           </div>
 
+          {/* Central Chart */}
           <div className="rounded-2xl bg-slate-900/80 border border-slate-800 p-3.5 backdrop-blur-xl">
             <div className="flex items-center justify-between mb-2 text-[11px]">
               <div className="flex items-center gap-3">
@@ -1194,9 +1185,6 @@ export default function App() {
 
             <div 
               ref={chartScrollRef}
-              onTouchStart={(e) => e.stopPropagation()}
-              onTouchMove={(e) => e.stopPropagation()}
-              onTouchEnd={(e) => e.stopPropagation()}
               className="relative w-full h-48 bg-slate-950/70 rounded-xl overflow-x-auto overflow-y-hidden border border-slate-900 scrollbar-thin scrollbar-thumb-slate-800"
             >
               {chartData ? (
@@ -1207,17 +1195,17 @@ export default function App() {
                   >
                     <rect
                       x="0"
-                      y={chartData.getYH(62)}
+                      y={chartData.getYH(60)}
                       width={chartData.width}
-                      height={chartData.getYH(50) - chartData.getYH(62)}
+                      height={chartData.getYH(50) - chartData.getYH(60)}
                       fill="rgba(16, 185, 129, 0.08)"
                     />
                     
                     <line
                       x1="0"
-                      y1={chartData.getYH(64)}
+                      y1={chartData.getYH(67)}
                       x2={chartData.width}
-                      y2={chartData.getYH(64)}
+                      y2={chartData.getYH(67)}
                       stroke="rgba(244, 63, 94, 0.4)"
                       strokeDasharray="4 4"
                       strokeWidth="1"
@@ -1297,12 +1285,13 @@ export default function App() {
             )}
           </div>
 
+          {/* Raw Sensor Logs Table */}
           <div className="rounded-2xl bg-slate-900/80 border border-slate-800 p-3.5 backdrop-blur-xl">
             <div className="flex items-center justify-between mb-2.5">
               <div className="flex items-center gap-2">
                 <TableIcon className="h-4 w-4 text-cyan-400" />
                 <h3 className="text-xs font-bold uppercase tracking-wider text-slate-200">
-                  ตารางข้อมูลเซนเซอร์ ({historyLogs.length} รายการ)
+                  ตารางข้อมูลเซนเซอร์ ({historyLogs.length})
                 </h3>
               </div>
               <button
@@ -1349,15 +1338,52 @@ export default function App() {
             )}
           </div>
 
+          {/* Sleep Sessions Timeline with Filter Selector */}
           <div className="rounded-2xl bg-slate-900/80 border border-slate-800 p-3.5 backdrop-blur-xl">
-            <div className="flex items-center gap-2 mb-3">
-              <Clock className="h-4 w-4 text-cyan-400" />
-              <h3 className="text-xs font-bold uppercase tracking-wider text-slate-200">ไทม์ไลน์เซสชันการนอนจริง</h3>
+            <div className="flex items-center justify-between mb-3">
+              <div className="flex items-center gap-2">
+                <Clock className="h-4 w-4 text-cyan-400" />
+                <h3 className="text-xs font-bold uppercase tracking-wider text-slate-200">ประวัติการนอนจริง</h3>
+              </div>
+
+              {/* Segmented Filter Control */}
+              <div className="flex items-center gap-1 p-0.5 rounded-lg bg-slate-950 border border-slate-800 text-[10px]">
+                <button
+                  onClick={() => setSleepFilter('recent')}
+                  className={`px-2 py-0.5 rounded-md transition font-medium ${
+                    sleepFilter === 'recent' 
+                      ? 'bg-cyan-500 text-slate-950 font-semibold' 
+                      : 'text-slate-400 hover:text-slate-200'
+                  }`}
+                >
+                  ล่าสุด 3 คืน
+                </button>
+                <button
+                  onClick={() => setSleepFilter('all')}
+                  className={`px-2 py-0.5 rounded-md transition font-medium ${
+                    sleepFilter === 'all' 
+                      ? 'bg-cyan-500 text-slate-950 font-semibold' 
+                      : 'text-slate-400 hover:text-slate-200'
+                  }`}
+                >
+                  ทั้งหมด ({sleepSessions.length})
+                </button>
+                <button
+                  onClick={() => setSleepFilter('dehumidified')}
+                  className={`px-2 py-0.5 rounded-md transition font-medium ${
+                    sleepFilter === 'dehumidified' 
+                      ? 'bg-cyan-500 text-slate-950 font-semibold' 
+                      : 'text-slate-400 hover:text-slate-200'
+                  }`}
+                >
+                  มีรีดน้ำ
+                </button>
+              </div>
             </div>
 
-            {sleepSessions.length > 0 ? (
-              <div className="space-y-3 relative before:absolute before:inset-0 before:left-3 before:w-0.5 before:bg-slate-800">
-                {sleepSessions.map((s, idx) => (
+            {filteredSessions.length > 0 ? (
+              <div className="space-y-2.5 relative before:absolute before:inset-0 before:left-3 before:w-0.5 before:bg-slate-800">
+                {filteredSessions.map((s, idx) => (
                   <div key={idx} className="relative flex items-start gap-3 pl-1">
                     <span className="h-4 w-4 rounded-full bg-indigo-500/20 border border-indigo-400 flex items-center justify-center mt-0.5 z-10">
                       <Moon className="h-2.5 w-2.5 text-indigo-400" />
@@ -1372,8 +1398,10 @@ export default function App() {
                       </div>
                       <div className="text-[11px] text-slate-400 mt-1 flex items-center justify-between">
                         <span>เฉลี่ย: {s.avg_temp}°C • {s.avg_humidity}%RH</span>
-                        {s.dry_mode_count ? (
-                          <span className="text-cyan-400 text-[10px]">รีดน้ำ {s.dry_mode_count} ครั้ง</span>
+                        {(s.dry_mode_count ?? 0) > 0 ? (
+                          <span className="text-cyan-400 text-[10px] bg-cyan-950/60 px-2 py-0.5 rounded border border-cyan-500/30">
+                            รีดน้ำ {s.dry_mode_count} ครั้ง
+                          </span>
                         ) : null}
                       </div>
                     </div>
@@ -1382,7 +1410,7 @@ export default function App() {
               </div>
             ) : (
               <div className="py-4 text-center text-xs text-slate-500">
-                ยังไม่มีประวัติการนอนที่บันทึก
+                ไม่พบประวัติการนอนตามตัวกรองที่เลือก
               </div>
             )}
           </div>
