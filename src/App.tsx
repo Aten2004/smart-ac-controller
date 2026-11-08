@@ -157,7 +157,6 @@ export default function App() {
   };
 
   const fetchAnalyticsData = async (targetDate?: string) => {
-    setRefreshing(true);
     try {
       if (targetDate) {
         const [y, m, d] = targetDate.split('-').map(Number);
