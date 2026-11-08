@@ -858,6 +858,7 @@ export default function App() {
   const isSleeping = acState.power && (acState.is_sleeping ?? false);
   const isDehumMode = acState.power && (acState.mode === 'deep_cool' || (acState.target_temp === 23 && acState.mode !== 'dry'));
   const isDry = acState.power && acState.mode === 'dry';
+  const displayTemp = (acState.power && (acState.mode === 'deep_cool' || isDehumMode)) ? 23 : acState.target_temp;
   const scheduleEnabled = acState.schedule_enabled ?? false;
   const scheduleStart = acState.schedule_start || '20:00';
   const scheduleEnd = acState.schedule_end || '10:00';
@@ -965,8 +966,8 @@ export default function App() {
             {/* Stepper Temperature Display */}
             <div className="flex items-center justify-around py-2 my-1">
               <button
-                disabled={loading || !acState.power || acState.target_temp <= 18}
-                onClick={() => updateState({ target_temp: Math.max(18, acState.target_temp - 1), mode: 'cool' })}
+                disabled={loading || !acState.power || displayTemp <= 18}
+                onClick={() => updateState({ target_temp: Math.max(18, displayTemp - 1), mode: 'cool' })}
                 className="h-12 w-12 rounded-2xl bg-slate-900 border border-slate-800 flex items-center justify-center text-slate-300 hover:text-white active:scale-95 disabled:opacity-30 transition"
               >
                 <ChevronDown className="h-6 w-6" />
@@ -975,18 +976,26 @@ export default function App() {
               <div className="text-center">
                 <div className="flex items-baseline justify-center">
                   <span className="text-6xl font-black tracking-tight text-white">
-                    {acState.power ? (isDry ? '--' : acState.target_temp) : '--'}
+                    {acState.power ? (isDry ? '--' : displayTemp) : '--'}
                   </span>
                   {!isDry && acState.power && <span className="text-2xl font-light text-slate-400 ml-1">°C</span>}
                 </div>
                 <div className="text-[11px] text-emerald-400 font-semibold mt-1">
-                  {acState.target_temp === 25 ? 'อุณหภูมินอนหลับลึก สบายตัวสูงสุด' : acState.target_temp === 24 ? 'โหมดรีดน้ำนุ่มนวล (Gentle Cool)' : acState.target_temp === 23 ? 'โหมดรีดน้ำเร่งด่วน 23°C' : 'โหมดควบคุมอุณหภูมิปกติ'}
+                  {acState.mode === 'deep_cool' || isDehumMode
+                    ? 'โหมดรีดน้ำเร่งด่วน 23°C (Auto Guard กำลังทำงาน)'
+                    : displayTemp === 25 
+                      ? 'อุณหภูมินอนหลับลึก สบายตัวสูงสุด' 
+                      : displayTemp === 24 
+                        ? 'โหมดรีดน้ำนุ่มนวล (Gentle Cool)' 
+                        : displayTemp === 23 
+                          ? 'โหมดรีดน้ำเร่งด่วน 23°C' 
+                          : 'โหมดควบคุมอุณหภูมิปกติ'}
                 </div>
               </div>
 
               <button
-                disabled={loading || !acState.power || acState.target_temp >= 30}
-                onClick={() => updateState({ target_temp: Math.min(30, acState.target_temp + 1), mode: 'cool' })}
+                disabled={loading || !acState.power || displayTemp >= 30}
+                onClick={() => updateState({ target_temp: Math.min(30, displayTemp + 1), mode: 'cool' })}
                 className="h-12 w-12 rounded-2xl bg-slate-900 border border-slate-800 flex items-center justify-center text-slate-300 hover:text-white active:scale-95 disabled:opacity-30 transition"
               >
                 <ChevronUp className="h-6 w-6" />
@@ -999,7 +1008,7 @@ export default function App() {
                 disabled={loading}
                 onClick={() => updateState({ power: true, target_temp: 25, mode: 'cool' })}
                 className={`py-2.5 px-2 rounded-2xl border text-xs font-semibold flex flex-col items-center justify-center gap-1 transition active:scale-95 ${
-                  acState.power && acState.target_temp === 25 && acState.mode !== 'dry'
+                  acState.power && displayTemp === 25 && acState.mode !== 'dry' && !isDehumMode
                     ? 'bg-cyan-500 text-slate-950 border-cyan-400 shadow-[0_0_12px_rgba(6,182,212,0.3)]'
                     : 'bg-slate-900/80 border-slate-800 text-slate-400 hover:text-slate-200'
                 }`}
@@ -1012,7 +1021,7 @@ export default function App() {
                 disabled={loading}
                 onClick={() => updateState({ power: true, target_temp: 24, mode: 'cool' })}
                 className={`py-2.5 px-2 rounded-2xl border text-xs font-semibold flex flex-col items-center justify-center gap-1 transition active:scale-95 ${
-                  acState.power && acState.target_temp === 24 && acState.mode !== 'dry'
+                  acState.power && displayTemp === 24 && acState.mode !== 'dry' && !isDehumMode
                     ? 'bg-teal-500 text-slate-950 border-teal-400 shadow-[0_0_12px_rgba(20,184,166,0.3)]'
                     : 'bg-slate-900/80 border-slate-800 text-slate-400 hover:text-slate-200'
                 }`}
@@ -1025,7 +1034,7 @@ export default function App() {
                 disabled={loading}
                 onClick={() => updateState({ power: true, target_temp: 23, mode: 'cool' })}
                 className={`py-2.5 px-2 rounded-2xl border text-xs font-semibold flex flex-col items-center justify-center gap-1 transition active:scale-95 ${
-                  acState.power && acState.target_temp === 23 && acState.mode !== 'dry'
+                  acState.power && (displayTemp === 23 || isDehumMode) && acState.mode !== 'dry'
                     ? 'bg-blue-500 text-white border-blue-400 shadow-[0_0_12px_rgba(59,130,246,0.3)]'
                     : 'bg-slate-900/80 border-slate-800 text-slate-400 hover:text-slate-200'
                 }`}
