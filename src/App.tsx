@@ -3,11 +3,11 @@ import { supabase } from './supabaseClient';
 import { 
   Power, Droplets, Thermometer, ShieldCheck, 
   Lock, Wind, Snowflake, SunDim, Sparkles, 
-  Moon, Clock, ChevronUp, ChevronDown, CheckCircle2,
-  LineChart as ChartIcon, Sliders, Activity, RefreshCw, 
+  Moon, Clock, ChevronUp, ChevronDown, 
+  Sliders, Activity, 
   Loader2, Copy, Check, Timer as TimerIcon, Trash2, 
-  Table as TableIcon, Calendar, Smartphone, Cloud,
-  Award, Zap, BarChart2, Bed, AlertCircle, X
+  Table as TableIcon, Calendar, Smartphone, 
+  BarChart2, X
 } from 'lucide-react';
 
 interface ACState {
@@ -73,7 +73,6 @@ export default function App() {
   const [pinInput, setPinInput] = useState<string>('');
   const [currentTab, setCurrentTab] = useState<'remote' | 'sleep'>('remote');
   const [loading, setLoading] = useState<boolean>(false);
-  const [refreshing, setRefreshing] = useState<boolean>(false);
 
   const [acState, setAcState] = useState<ACState | null>(null);
   const [sensor, setSensor] = useState<{ temperature: number | null; humidity: number | null }>({ 
@@ -217,8 +216,6 @@ export default function App() {
       }
     } catch (err) {
       console.error('Fetch analytics error:', err);
-    } finally {
-      setRefreshing(false);
     }
   };
 
