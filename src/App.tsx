@@ -117,7 +117,6 @@ export default function App() {
     }
   }, []);
 
-  // วัดขนาดความกว้าง Container ของกราฟเพื่อคำนวณสัดส่วนแบบ Responsive
   useEffect(() => {
     if (chartScrollRef.current) {
       setContainerWidth(chartScrollRef.current.clientWidth);
@@ -131,7 +130,6 @@ export default function App() {
     return () => window.removeEventListener('resize', handleResize);
   }, []);
 
-  // รีเซ็ตจุดที่เลือกกลับไปเป็นจุดล่าสุดเมื่อเปลี่ยนตัวกรอง
   useEffect(() => {
     setHoveredPoint(null);
   }, [logRange, sensorFilterDate, sensorFilterMode]);
@@ -144,11 +142,83 @@ export default function App() {
     return mins > 0 ? `${hours} ชม. ${mins} น.` : `${hours} ชม.`;
   };
 
-  // Realtime Polling & Reconnect Engine (Auto-Wake)
+  const handleSleepSessionEnd = async (startTimeStr: string, customEndTime?: Date) => {
+    const endTime = customEndTime || new Date();
+    const startTime = new Date(startTimeStr);
+    const durationMins = Math.floor((endTime.getTime() - startTime.getTime()) / 60000);
+
+    if (durationMins >= MIN_SLEEP_THRESHOLD_MINS) {
+      const { data: logs } = await supabase
+        .from('sensor_logs')
+        .select('temperature, humidity, ac_mode')
+        .gte('created_at', startTime.toISOString())
+        .lte('created_at', endTime.toISOString());
+
+      let avgT = sensor.temperature ?? 25.0;
+      let avgH = sensor.humidity ?? 58.0;
+      let dryCount = 0;
+
+      if (logs && logs.length > 0) {
+        const validTemps = logs.map(l => Number(l.temperature)).filter(v => !isNaN(v));
+        const validHums = logs.map(l => Number(l.humidity)).filter(v => !isNaN(v));
+        if (validTemps.length > 0) avgT = Number((validTemps.reduce((a, b) => a + b, 0) / validTemps.length).toFixed(1));
+        if (validHums.length > 0) avgH = Number((validHums.reduce((a, b) => a + b, 0) / validHums.length).toFixed(1));
+        dryCount = logs.filter(l => l.ac_mode === 'deep_cool' || l.ac_mode === 'dry').length;
+      }
+
+      // ตรวจสอบก่อนว่าเคยบันทึกรอบนี้ไปแล้วหรือไม่ เพื่อป้องกันการบันทึกซ้ำ
+      const { data: existingSessions } = await supabase
+        .from('sleep_sessions')
+        .select('id')
+        .eq('started_at', startTime.toISOString())
+        .limit(1);
+
+      if (existingSessions && existingSessions.length > 0) {
+        const { data } = await supabase
+          .from('sleep_sessions')
+          .update({
+            ended_at: endTime.toISOString(),
+            duration_minutes: durationMins,
+            avg_temp: avgT,
+            avg_humidity: avgH,
+            dry_mode_count: dryCount
+          })
+          .eq('id', existingSessions[0].id)
+          .select()
+          .single();
+
+        if (data) {
+          setSleepSessions(prev => prev.map(s => s.id === data.id ? data : s));
+        }
+      } else {
+        const newSession = {
+          started_at: startTime.toISOString(),
+          ended_at: endTime.toISOString(),
+          duration_minutes: durationMins,
+          avg_temp: avgT,
+          avg_humidity: avgH,
+          dry_mode_count: dryCount
+        };
+
+        const { data } = await supabase.from('sleep_sessions').insert([newSession]).select().single();
+        if (data) {
+          setSleepSessions(prev => [data, ...prev]);
+        }
+      }
+    }
+  };
+
   const fetchControlStateOnly = async () => {
     try {
       const { data: ac } = await supabase.from('ac_control').select('*').eq('id', 1).single();
       if (ac && Date.now() >= manualOverrideLockUntil.current) {
+        // ดักจับกรณีตื่นนอนภายนอก (เช่น Routine สั่ง is_sleeping = false ขณะแอปปิดอยู่)
+        if (!ac.is_sleeping && ac.sleep_started_at) {
+          const wakeTime = new Date(ac.updated_at || Date.now());
+          await handleSleepSessionEnd(ac.sleep_started_at, wakeTime);
+          await supabase.from('ac_control').update({ sleep_started_at: null }).eq('id', 1);
+          ac.sleep_started_at = null;
+        }
         setAcState(ac);
       }
     } catch (err) {
@@ -247,7 +317,19 @@ export default function App() {
       .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'ac_control' }, (payload) => {
         if (Date.now() < manualOverrideLockUntil.current) return;
         if (payload.new && (payload.new as ACState).id === 1) {
-          setAcState(payload.new as ACState);
+          const newState = payload.new as ACState;
+          setAcState(prev => {
+            // เมื่อสถานะเปลี่ยนเป็นตื่นนอน (is_sleeping จาก true เป็น false) ผ่าน Realtime
+            if (prev?.is_sleeping && !newState.is_sleeping) {
+              const activeSleepStart = prev.sleep_started_at || prev.session_started_at || prev.updated_at;
+              if (activeSleepStart) {
+                const wakeTime = new Date(newState.updated_at || Date.now());
+                handleSleepSessionEnd(activeSleepStart, wakeTime);
+                supabase.from('ac_control').update({ sleep_started_at: null }).eq('id', 1);
+              }
+            }
+            return newState;
+          });
         }
       })
       .subscribe();
@@ -279,6 +361,29 @@ export default function App() {
       supabase.removeChannel(sensorChannel);
     };
   }, [isAuthenticated, logRange, sensorFilterDate]);
+
+  // ระบบตรวจจับการตื่นนอนอัตโนมัติ: ถ้าเปิดจอค้างไว้เกิน 3 นาที ขณะยังเป็นโหมดหลับ
+  useEffect(() => {
+    if (!acState?.power || !acState?.is_sleeping) return;
+
+    let activeSeconds = 0;
+    const thresholdSeconds = 180; // 3 นาที
+
+    const checkInterval = setInterval(() => {
+      if (document.visibilityState === 'visible') {
+        activeSeconds += 5;
+        if (activeSeconds >= thresholdSeconds) {
+          // เล่นมือถือเกินเวลา -> ปลดสถานะนอนหลับและบันทึกผลทันที
+          updateState({ is_sleeping: false });
+          clearInterval(checkInterval);
+        }
+      } else {
+        activeSeconds = 0;
+      }
+    }, 5000);
+
+    return () => clearInterval(checkInterval);
+  }, [acState?.power, acState?.is_sleeping]);
 
   useEffect(() => {
     if (!acState || !acState.power) {
@@ -396,46 +501,6 @@ export default function App() {
     }
   };
 
-  const handleSleepSessionEnd = async (startTimeStr: string) => {
-    const endTime = new Date();
-    const startTime = new Date(startTimeStr);
-    const durationMins = Math.floor((endTime.getTime() - startTime.getTime()) / 60000);
-
-    if (durationMins >= MIN_SLEEP_THRESHOLD_MINS) {
-      const { data: logs } = await supabase
-        .from('sensor_logs')
-        .select('temperature, humidity, ac_mode')
-        .gte('created_at', startTime.toISOString())
-        .lte('created_at', endTime.toISOString());
-
-      let avgT = sensor.temperature ?? 25.0;
-      let avgH = sensor.humidity ?? 58.0;
-      let dryCount = 0;
-
-      if (logs && logs.length > 0) {
-        const validTemps = logs.map(l => Number(l.temperature)).filter(v => !isNaN(v));
-        const validHums = logs.map(l => Number(l.humidity)).filter(v => !isNaN(v));
-        if (validTemps.length > 0) avgT = Number((validTemps.reduce((a, b) => a + b, 0) / validTemps.length).toFixed(1));
-        if (validHums.length > 0) avgH = Number((validHums.reduce((a, b) => a + b, 0) / validHums.length).toFixed(1));
-        dryCount = logs.filter(l => l.ac_mode === 'deep_cool' || l.ac_mode === 'dry').length;
-      }
-
-      const newSession = {
-        started_at: startTime.toISOString(),
-        ended_at: endTime.toISOString(),
-        duration_minutes: durationMins,
-        avg_temp: avgT,
-        avg_humidity: avgH,
-        dry_mode_count: dryCount
-      };
-
-      const { data } = await supabase.from('sleep_sessions').insert([newSession]).select().single();
-      if (data) {
-        setSleepSessions(prev => [data, ...prev]);
-      }
-    }
-  };
-
   const updateState = async (updates: Partial<ACState>) => {
     if (!acState) return;
     setLoading(true);
@@ -449,15 +514,35 @@ export default function App() {
     const nextHex = calculateLgHex(nextPower, nextMode, nextTemp, nextFan);
 
     let sessionStartedAt = acState.session_started_at;
+    let sleepStartedAt = acState.sleep_started_at;
+
+    // 1. ตรวจจับการตื่นนอนจากการเปิดจอ/หยิบมือถือ (is_sleeping เปลี่ยนเป็น false)
+    if (updates.is_sleeping !== undefined) {
+      if (!updates.is_sleeping && (acState.is_sleeping ?? false)) {
+        const activeSleepStart = acState.sleep_started_at || acState.session_started_at || acState.updated_at;
+        if (activeSleepStart) {
+          await handleSleepSessionEnd(activeSleepStart, new Date());
+        }
+        sleepStartedAt = null; // รีเซ็ตเพื่อไม่ให้บันทึกซ้ำ
+      } else if (updates.is_sleeping && !(acState.is_sleeping ?? false)) {
+        sleepStartedAt = new Date().toISOString();
+      }
+    }
+
+    // 2. จัดการเมื่อเปิดหรือปิดแอร์
     if (updates.power !== undefined) {
       if (updates.power && !acState.power) {
         sessionStartedAt = new Date().toISOString();
+        if (!sleepStartedAt) {
+          sleepStartedAt = new Date().toISOString();
+        }
       } else if (!updates.power && acState.power) {
-        const activeStart = acState.session_started_at || acState.updated_at;
-        if (activeStart) {
-          await handleSleepSessionEnd(activeStart);
+        // บันทึกเฉพาะกรณีที่ก่อนหน้านี้ยังไม่ได้บันทึกตื่นนอน (is_sleeping ยังเป็น true)
+        if (acState.is_sleeping && sleepStartedAt) {
+          await handleSleepSessionEnd(sleepStartedAt, new Date());
         }
         sessionStartedAt = null;
+        sleepStartedAt = null;
       }
     }
 
@@ -470,6 +555,7 @@ export default function App() {
       is_auto: nextAuto,
       last_command_code: nextHex,
       session_started_at: sessionStartedAt,
+      sleep_started_at: sleepStartedAt,
       updated_at: new Date().toISOString()
     };
 
@@ -663,7 +749,7 @@ export default function App() {
     let endTimeStr = '--:--';
 
     if (isCurrentlySleeping) {
-      const startIso = acState?.session_started_at || acState?.updated_at;
+      const startIso = acState?.sleep_started_at || acState?.session_started_at || acState?.updated_at;
       if (startIso) startTimeStr = new Date(startIso).toLocaleTimeString('th-TH', { hour: '2-digit', minute: '2-digit' });
       endTimeStr = 'กำลังนอนหลับ';
     } else if (lastSession) {
@@ -702,15 +788,12 @@ export default function App() {
     };
   }, [sleepSessions, inBedDurationMins, acState, stats]);
 
-  // จุดล่าสุดของชุดข้อมูลปัจจุบัน
   const latestPoint = useMemo(() => {
     return historyLogs.length > 0 ? historyLogs[historyLogs.length - 1] : null;
   }, [historyLogs]);
 
-  // จุดที่กำลังแสดงรายละเอียด: ถ้าไม่มีการแตะจุดอื่น จะแสดงจุดล่าสุดเสมอ
   const activePoint = hoveredPoint || latestPoint;
 
-  // คำนวณข้อมูลกราฟ เส้นแบ่งช่วงเวลา และระยะการเลื่อนซ้ายขวาไม่ให้เกินขอบ
   const chartData = useMemo(() => {
     if (historyLogs.length < 2) return null;
     const paddingLeft = 32;
@@ -745,7 +828,6 @@ export default function App() {
       return { x, yt, yh, log, index: i };
     });
 
-    // สร้างเส้นแบ่งช่วงเวลา (Time Dividers)
     const t0 = new Date(historyLogs[0].created_at).getTime();
     const tEnd = new Date(historyLogs[historyLogs.length - 1].created_at).getTime();
     const totalMinutes = Math.max(1, (tEnd - t0) / 60000);
@@ -788,7 +870,6 @@ export default function App() {
     return { tempPath, humPath, dots, width, height, getYH, getYT, timeDividers, paddingLeft, paddingRight, paddingTop, paddingBottom };
   }, [historyLogs, containerWidth]);
 
-  // เลื่อนหน้าจอกราฟไปที่จุดล่าสุด (ขวาสุด) เสมอเมื่อข้อมูลเปลี่ยน
   useEffect(() => {
     const timer = setTimeout(() => {
       if (chartScrollRef.current) {
@@ -903,7 +984,7 @@ export default function App() {
         </button>
       </header>
 
-      {/* ======================= TAB 1: หน้ารีโมทแอร์เต็มรูปแบบ + กราฟสด (DEFAULT HOME) ======================= */}
+      {/* ======================= TAB 1: หน้ารีโมทแอร์เต็มรูปแบบ + กราฟสด ======================= */}
       {currentTab === 'remote' && (
         <div className="w-full max-w-md flex-1 space-y-3.5 animate-fadeIn">
           {/* Room Environment Badges */}
@@ -1002,7 +1083,7 @@ export default function App() {
               </button>
             </div>
 
-            {/* Row 1: Quick Sleep & Chill Presets */}
+            {/* Row 1: Quick Presets */}
             <div className="grid grid-cols-3 gap-2 mt-3 pt-3 border-t border-slate-800/80">
               <button
                 disabled={loading}
@@ -1044,7 +1125,7 @@ export default function App() {
               </button>
             </div>
 
-            {/* Row 2: Standard Remote Controls (Mode & Fan & Power) */}
+            {/* Row 2: Standard Controls */}
             <div className="grid grid-cols-4 gap-2 mt-2">
               <button
                 disabled={loading || !acState.power}
@@ -1106,16 +1187,16 @@ export default function App() {
                   onClick={() => updateState({ is_sleeping: !(acState.is_sleeping ?? false) })}
                   className={`flex items-center gap-1.5 px-3 py-1 rounded-full border text-[11px] font-medium transition active:scale-95 ${
                     isSleeping
-                      ? 'bg-indigo-500/20 border-indigo-500/40 text-indigo-300'
+                      ? 'bg-indigo-500/20 border-indigo-500/40 text-indigo-300 animate-pulse'
                       : 'bg-slate-900 border-slate-800 text-slate-400'
                   }`}
                 >
                   {isSleeping ? <Moon className="h-3 w-3 text-indigo-400" /> : <Smartphone className="h-3 w-3 text-amber-400" />}
-                  <span>{isSleeping ? 'สถานะ: วางมือถือนอนแล้ว' : 'สถานะ: ตื่น / เล่นมือถือ'}</span>
+                  <span>{isSleeping ? 'สถานะ: วางมือถือนอนแล้ว (แตะเมื่อตื่น)' : 'สถานะ: ตื่น / เล่นมือถือ'}</span>
                 </button>
 
                 <span className="text-[10px] text-slate-400">
-                  เปิดมาแล้ว: {formatHoursMins(inBedDurationMins)}
+                  แอร์เปิดมาแล้ว: {formatHoursMins(inBedDurationMins)}
                 </span>
               </div>
             )}
@@ -1305,7 +1386,7 @@ export default function App() {
               </div>
             </div>
 
-            {/* SVG Chart with Time Dividers and Bounded Scrolling */}
+            {/* SVG Chart */}
             <div 
               ref={chartScrollRef}
               className="relative w-full h-44 bg-slate-950/70 rounded-2xl overflow-x-auto overflow-y-hidden border border-slate-900 scrollbar-thin scrollbar-thumb-slate-800 overscroll-x-contain touch-pan-x"
@@ -1313,7 +1394,6 @@ export default function App() {
               {chartData ? (
                 <div style={{ width: `${chartData.width}px` }} className="h-full relative">
                   <svg viewBox={`0 0 ${chartData.width} ${chartData.height}`} className="w-full h-full block">
-                    {/* Healthy Zone: 50% - 60% RH */}
                     <rect
                       x="0"
                       y={chartData.getYH(60)}
@@ -1322,7 +1402,6 @@ export default function App() {
                       fill="rgba(16, 185, 129, 0.08)"
                     />
 
-                    {/* เส้นแบ่งช่วงเวลา (Time Dividers) */}
                     {chartData.timeDividers.map((div, i) => (
                       <g key={`div-${i}`}>
                         <line
@@ -1352,7 +1431,6 @@ export default function App() {
                     <path d={chartData.humPath} fill="none" stroke="#06b6d4" strokeWidth="2.2" strokeLinecap="round" />
                     <path d={chartData.tempPath} fill="none" stroke="#f59e0b" strokeWidth="2.2" strokeLinecap="round" />
 
-                    {/* จุดข้อมูล พร้อมการแสดงไฮไลต์จุดล่าสุดเสมอ */}
                     {chartData.dots.map((d, i) => {
                       const isSelected = activePoint?.id === d.log.id || (!hoveredPoint && i === chartData.dots.length - 1);
                       return (
@@ -1390,7 +1468,7 @@ export default function App() {
               )}
             </div>
 
-            {/* การ์ดรายละเอียดจุดที่เลือก (แสดงจุดล่าสุดเสมอ แม้ว่าจะกดตัวกรองใดๆ) */}
+            {/* Active Point Card */}
             {activePoint ? (
               <div className="rounded-2xl bg-slate-950 p-3 border border-slate-800 flex items-center justify-between text-xs animate-fadeIn shadow-lg">
                 <div>
@@ -1442,7 +1520,7 @@ export default function App() {
               <p className="text-center text-[10px] text-slate-500">รอรับข้อมูลเซนเซอร์...</p>
             )}
 
-            {/* Redesigned Climate Sensor Table with Date & Mode Filters */}
+            {/* Raw Table */}
             <div className="pt-2 border-t border-slate-800/80">
               <div className="flex items-center justify-between mb-2">
                 <div className="flex items-center gap-1.5">
@@ -1577,7 +1655,7 @@ export default function App() {
         </div>
       )}
 
-      {/* ======================= TAB 2: วัดการนอนจริงจากการใช้มือถือ (PROFESSIONAL DARK HEALTH) ======================= */}
+      {/* ======================= TAB 2: วัดการนอนจริงจากการใช้มือถือ ======================= */}
       {currentTab === 'sleep' && (
         <div className="w-full max-w-md flex-1 space-y-3.5 animate-fadeIn">
           {/* Header */}
@@ -1593,7 +1671,7 @@ export default function App() {
             </span>
           </div>
 
-          {/* Card 1: Clean KPI Summary (จัดสมดุลและระยะห่างไม่ให้ล้น) */}
+          {/* Card 1: Clean KPI Summary */}
           <div className="rounded-3xl bg-slate-900/90 border border-slate-800 p-4 sm:p-5 shadow-xl backdrop-blur-xl space-y-3.5">
             <div className="flex items-start justify-between gap-2">
               <div className="min-w-0">
@@ -1614,7 +1692,7 @@ export default function App() {
               </div>
             </div>
 
-            {/* Progress Bar เทียบเป้าหมาย */}
+            {/* Progress Bar */}
             <div className="space-y-1.5 pt-0.5">
               <div className="flex justify-between items-center text-[11px] text-slate-400">
                 <span>เทียบเป้าหมาย 8 ชั่วโมง</span>
@@ -1628,7 +1706,7 @@ export default function App() {
               </div>
             </div>
 
-            {/* 3 Metric Pills สมมาตร ไม่บีบตัวหนังสือ */}
+            {/* 3 Metric Pills */}
             <div className="grid grid-cols-3 gap-2 pt-2 border-t border-slate-800/80 text-center">
               <div className="p-2 sm:p-2.5 rounded-2xl bg-slate-950/60 border border-slate-800/60 flex flex-col justify-center">
                 <div className="text-[10px] text-slate-400 truncate">สถานะจอมือถือ</div>
@@ -1651,7 +1729,7 @@ export default function App() {
             </div>
           </div>
 
-          {/* Card 2: 7-Day Sleep Duration Column Chart (สมมาตร ไม่ทับซ้อน คำไม่ล้นขอบ) */}
+          {/* Card 2: 7-Day Sleep Duration Column Chart */}
           <div className="rounded-3xl bg-slate-900/90 border border-slate-800 p-4 sm:p-4.5 backdrop-blur-xl space-y-3">
             <div className="flex items-center justify-between gap-2">
               <div className="flex items-center gap-1.5 min-w-0">
@@ -1665,7 +1743,6 @@ export default function App() {
               </span>
             </div>
 
-            {/* Vertical Column Chart */}
             <div className="pt-5 pb-1">
               {(() => {
                 const maxHoursInWeek = Math.max(8.5, ...sleepMetrics.past7DaysData.map(d => d.hours));
@@ -1677,8 +1754,7 @@ export default function App() {
                     <div 
                       style={{ bottom: `${targetLineBottomPct}%` }}
                       className="absolute left-0 right-0 border-b border-dashed border-slate-700/70 pointer-events-none z-0"
-                    >
-                    </div>
+                    />
 
                     {sleepMetrics.past7DaysData.map((day, idx) => {
                       const barHeightPct = Math.min(100, Math.round((day.hours / chartCeiling) * 100));
@@ -1721,7 +1797,7 @@ export default function App() {
             </p>
           </div>
 
-          {/* Card 3: Session Details & Night Phone Activity */}
+          {/* Card 3: Session Details */}
           <div className="rounded-3xl bg-slate-900/90 border border-slate-800 p-4 backdrop-blur-xl space-y-3">
             <div className="flex items-center justify-between">
               <span className="text-xs font-bold uppercase tracking-wider text-slate-200 flex items-center gap-1.5">
@@ -1767,7 +1843,7 @@ export default function App() {
             </div>
           </div>
 
-          {/* Card 4: ประวัติการนอนย้อนหลัง พร้อมตัวกรอง (Sleep History Filter Toolbar) */}
+          {/* Card 4: ประวัติการนอนย้อนหลัง พร้อมตัวกรอง */}
           <div className="rounded-3xl bg-slate-900/90 border border-slate-800 p-4 backdrop-blur-xl space-y-3">
             <div className="flex items-center justify-between">
               <span className="text-xs font-bold uppercase tracking-wider text-slate-200 flex items-center gap-1.5">
@@ -1781,7 +1857,6 @@ export default function App() {
               </span>
             </div>
 
-            {/* Filter Toolbar for Sleep Sessions */}
             <div className="grid grid-cols-2 gap-2 p-2.5 rounded-2xl bg-slate-950 border border-slate-800 text-xs">
               <div>
                 <label className="text-[10px] text-slate-400 block mb-1">เลือกวันที่</label>
@@ -1820,7 +1895,6 @@ export default function App() {
               )}
             </div>
 
-            {/* Sessions List */}
             {displayedSleepSessions.length > 0 ? (
               <div className="space-y-2 pt-1">
                 {displayedSleepSessions.map((s, idx) => {
@@ -1880,7 +1954,7 @@ export default function App() {
         </div>
       )}
 
-      {/* ======================= BOTTOM NAVIGATION DOCK (2 TABS) ======================= */}
+      {/* ======================= BOTTOM NAVIGATION DOCK ======================= */}
       <nav className="fixed bottom-3 w-[calc(100%-2rem)] max-w-md bg-slate-900/90 border border-slate-800 rounded-3xl p-1.5 backdrop-blur-2xl shadow-2xl flex items-center justify-around z-50">
         <button
           onClick={() => setCurrentTab('remote')}
