@@ -7,7 +7,7 @@ import {
   Sliders, Activity, 
   Loader2, Copy, Check, Timer as TimerIcon, Trash2, 
   Table as TableIcon, Calendar, Smartphone, 
-  BarChart2, X
+  BarChart2, X, Pencil
 } from 'lucide-react';
 
 interface ACState {
@@ -95,6 +95,12 @@ export default function App() {
   // Filters for Sleep Sessions
   const [sleepFilterType, setSleepFilterType] = useState<string>('all');
   const [sleepFilterDate, setSleepFilterDate] = useState<string>('');
+
+  // States for Editing Sleep Session
+  const [editingSession, setEditingSession] = useState<SleepSession | null>(null);
+  const [editStart, setEditStart] = useState<string>('');
+  const [editEnd, setEditEnd] = useState<string>('');
+  const [isUpdatingSession, setIsUpdatingSession] = useState<boolean>(false);
 
   const [showTimerCard, setShowTimerCard] = useState<boolean>(false);
   const [timerSubTab, setTimerSubTab] = useState<'countdown' | 'schedule'>('countdown');
@@ -899,6 +905,73 @@ export default function App() {
     if (!window.confirm('ต้องการลบประวัติการนอนรอบนี้ใช่หรือไม่?')) return;
     await supabase.from('sleep_sessions').delete().eq('id', id);
     setSleepSessions(prev => prev.filter(s => s.id !== id));
+  };
+
+  // Helper สำหรับแปลงเวลา ISO เป็นฟอร์แมต YYYY-MM-DDTHH:mm สำหรับ datetime-local
+  const toLocalInputValue = (isoStr?: string | null) => {
+    if (!isoStr) return '';
+    const d = new Date(isoStr);
+    const pad = (n: number) => String(n).padStart(2, '0');
+    return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+  };
+
+  const handleOpenEditSession = (session: SleepSession) => {
+    setEditingSession(session);
+    setEditStart(toLocalInputValue(session.started_at));
+    setEditEnd(toLocalInputValue(session.ended_at));
+  };
+
+  const handleUpdateSession = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!editingSession || !editingSession.id || !editStart || !editEnd) return;
+
+    const startDate = new Date(editStart);
+    const endDate = new Date(editEnd);
+
+    if (endDate <= startDate) {
+      alert('เวลาตื่นนอนต้องมากกว่าเวลาเริ่มนอน');
+      return;
+    }
+
+    const durationMinutes = Math.round((endDate.getTime() - startDate.getTime()) / 60000);
+
+    setIsUpdatingSession(true);
+    try {
+      const { error } = await supabase
+        .from('sleep_sessions')
+        .update({
+          started_at: startDate.toISOString(),
+          ended_at: endDate.toISOString(),
+          duration_minutes: durationMinutes,
+        })
+        .eq('id', editingSession.id);
+
+      if (error) {
+        console.error('Supabase update error:', error);
+        alert('เกิดข้อผิดพลาดในการอัปเดตข้อมูล: ' + error.message);
+        return;
+      }
+
+      setSleepSessions((prev) =>
+        prev.map((item) =>
+          item.id === editingSession.id
+            ? {
+                ...item,
+                started_at: startDate.toISOString(),
+                ended_at: endDate.toISOString(),
+                duration_minutes: durationMinutes,
+              }
+            : item
+        )
+      );
+
+      setEditingSession(null);
+    } catch (err) {
+      console.error(err);
+      alert('เกิดข้อผิดพลาดในการเชื่อมต่อเซิร์ฟเวอร์');
+    } finally {
+      setIsUpdatingSession(false);
+    }
   };
 
   if (!isAuthenticated) {
@@ -1911,6 +1984,13 @@ export default function App() {
                             {Math.floor(dur / 60)} ชม. {dur % 60} น.
                           </span>
                           <button
+                            onClick={() => handleOpenEditSession(s)}
+                            className="text-slate-500 hover:text-indigo-400 p-1 transition rounded hover:bg-slate-900 active:scale-90"
+                            title="แก้ไขเวลานี้"
+                          >
+                            <Pencil className="h-3.5 w-3.5" />
+                          </button>
+                          <button
                             onClick={() => handleDeleteSession(s.id)}
                             className="text-slate-500 hover:text-rose-400 p-1 transition rounded hover:bg-slate-900 active:scale-90"
                             title="ลบประวัตินี้"
@@ -1950,6 +2030,82 @@ export default function App() {
                 ไม่พบประวัติการนอนตามตัวกรองที่เลือก
               </div>
             )}
+          </div>
+        </div>
+      )}
+
+      {/* ======================= MODAL แก้ไขเวลาเซสชันการนอน ======================= */}
+      {editingSession && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/75 backdrop-blur-sm animate-fadeIn">
+          <div className="w-full max-w-sm rounded-3xl bg-slate-900 border border-slate-800 p-5 shadow-2xl space-y-4">
+            <div className="flex items-center justify-between border-b border-slate-800 pb-3">
+              <h3 className="text-sm font-bold text-white flex items-center gap-2">
+                <Pencil className="h-4 w-4 text-indigo-400" />
+                <span>แก้ไขเวลาเซสชันการนอน</span>
+              </h3>
+              <button
+                type="button"
+                onClick={() => setEditingSession(null)}
+                className="p-1 rounded-lg text-slate-400 hover:text-white hover:bg-slate-800 transition"
+              >
+                <X className="h-4 w-4" />
+              </button>
+            </div>
+
+            <form onSubmit={handleUpdateSession} className="space-y-3 text-xs">
+              <div>
+                <label className="text-[10px] text-slate-400 block mb-1 font-medium">
+                  เวลาเริ่มนอน (Started At)
+                </label>
+                <input
+                  type="datetime-local"
+                  value={editStart}
+                  onChange={(e) => setEditStart(e.target.value)}
+                  required
+                  className="w-full bg-slate-950 border border-slate-800 rounded-xl p-2.5 font-mono text-cyan-300 focus:outline-none focus:border-indigo-500"
+                />
+              </div>
+
+              <div>
+                <label className="text-[10px] text-slate-400 block mb-1 font-medium">
+                  เวลาตื่นนอน (Ended At)
+                </label>
+                <input
+                  type="datetime-local"
+                  value={editEnd}
+                  onChange={(e) => setEditEnd(e.target.value)}
+                  required
+                  className="w-full bg-slate-950 border border-slate-800 rounded-xl p-2.5 font-mono text-cyan-300 focus:outline-none focus:border-indigo-500"
+                />
+              </div>
+
+              {editStart && editEnd && new Date(editEnd) > new Date(editStart) && (
+                <div className="p-2.5 rounded-xl bg-indigo-950/40 border border-indigo-800/40 flex items-center justify-between text-[11px] text-indigo-300">
+                  <span>คำนวณเวลานอนใหม่:</span>
+                  <span className="font-mono font-bold text-white">
+                    {Math.floor((new Date(editEnd).getTime() - new Date(editStart).getTime()) / 3600000)} ชม.{' '}
+                    {Math.round(((new Date(editEnd).getTime() - new Date(editStart).getTime()) % 3600000) / 60000)} น.
+                  </span>
+                </div>
+              )}
+
+              <div className="flex items-center justify-end gap-2 pt-2">
+                <button
+                  type="button"
+                  onClick={() => setEditingSession(null)}
+                  className="px-3.5 py-2 rounded-xl text-slate-400 hover:text-slate-200 bg-slate-800/60 hover:bg-slate-800 transition"
+                >
+                  ยกเลิก
+                </button>
+                <button
+                  type="submit"
+                  disabled={isUpdatingSession}
+                  className="px-4 py-2 rounded-xl text-white font-semibold bg-indigo-600 hover:bg-indigo-500 shadow-lg shadow-indigo-600/30 transition disabled:opacity-50"
+                >
+                  {isUpdatingSession ? 'กำลังบันทึก...' : 'บันทึกการแก้ไข'}
+                </button>
+              </div>
+            </form>
           </div>
         </div>
       )}
