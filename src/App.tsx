@@ -7,7 +7,7 @@ import {
   Sliders, Activity, 
   Loader2, Copy, Check, Timer as TimerIcon, Trash2, 
   Table as TableIcon, Calendar, Smartphone, 
-  BarChart2, X, Pencil
+  BarChart2, X, Pencil, Sparkle
 } from 'lucide-react';
 
 interface ACState {
@@ -66,6 +66,28 @@ const calculateLgHex = (power: boolean, mode: string, temp: number, fanSpeed: st
   
   const checksum = (8 + 8 + 0 + 0 + tempNibble + fanNibble) & 0x0F;
   return `0x8800${tempNibble.toString(16).toUpperCase()}${fanNibble}${checksum.toString(16).toUpperCase()}`;
+};
+
+// ฟังก์ชันคำนวณเวลาเฉลี่ยแบบ Circular Mean เพื่อแก้ปัญหาข้ามเที่ยงคืน/ข้ามเที่ยงวัน ไม่ให้เพี้ยนเป็น 22:23 น.
+const getCircularAverageMinutes = (minutesList: number[]) => {
+  if (minutesList.length === 0) return 0;
+  let sumSin = 0;
+  let sumCos = 0;
+  for (const m of minutesList) {
+    const rad = (m / 1440) * 2 * Math.PI;
+    sumSin += Math.sin(rad);
+    sumCos += Math.cos(rad);
+  }
+  let avgRad = Math.atan2(sumSin, sumCos);
+  if (avgRad < 0) avgRad += 2 * Math.PI;
+  return (avgRad / (2 * Math.PI)) * 1440;
+};
+
+const getCircularDiffMinutes = (m1: number, m2: number) => {
+  let diff = (m1 - m2) % 1440;
+  if (diff > 720) diff -= 1440;
+  if (diff < -720) diff += 1440;
+  return diff;
 };
 
 export default function App() {
@@ -172,7 +194,6 @@ export default function App() {
         dryCount = logs.filter(l => l.ac_mode === 'deep_cool' || l.ac_mode === 'dry').length;
       }
 
-      // ตรวจสอบก่อนว่าเคยบันทึกรอบนี้ไปแล้วหรือไม่ เพื่อป้องกันการบันทึกซ้ำ
       const { data: existingSessions } = await supabase
         .from('sleep_sessions')
         .select('id')
@@ -218,7 +239,6 @@ export default function App() {
     try {
       const { data: ac } = await supabase.from('ac_control').select('*').eq('id', 1).single();
       if (ac && Date.now() >= manualOverrideLockUntil.current) {
-        // ดักจับกรณีตื่นนอนภายนอก (เช่น Routine สั่ง is_sleeping = false ขณะแอปปิดอยู่)
         if (!ac.is_sleeping && ac.sleep_started_at) {
           const wakeTime = new Date(ac.updated_at || Date.now());
           await handleSleepSessionEnd(ac.sleep_started_at, wakeTime);
@@ -325,7 +345,6 @@ export default function App() {
         if (payload.new && (payload.new as ACState).id === 1) {
           const newState = payload.new as ACState;
           setAcState(prev => {
-            // เมื่อสถานะเปลี่ยนเป็นตื่นนอน (is_sleeping จาก true เป็น false) ผ่าน Realtime
             if (prev?.is_sleeping && !newState.is_sleeping) {
               const activeSleepStart = prev.sleep_started_at || prev.session_started_at || prev.updated_at;
               if (activeSleepStart) {
@@ -368,18 +387,16 @@ export default function App() {
     };
   }, [isAuthenticated, logRange, sensorFilterDate]);
 
-  // ระบบตรวจจับการตื่นนอนอัตโนมัติ: ถ้าเปิดจอค้างไว้เกิน 3 นาที ขณะยังเป็นโหมดหลับ
   useEffect(() => {
     if (!acState?.power || !acState?.is_sleeping) return;
 
     let activeSeconds = 0;
-    const thresholdSeconds = 180; // 3 นาที
+    const thresholdSeconds = 180;
 
     const checkInterval = setInterval(() => {
       if (document.visibilityState === 'visible') {
         activeSeconds += 5;
         if (activeSeconds >= thresholdSeconds) {
-          // เล่นมือถือเกินเวลา -> ปลดสถานะนอนหลับและบันทึกผลทันที
           updateState({ is_sleeping: false });
           clearInterval(checkInterval);
         }
@@ -522,20 +539,18 @@ export default function App() {
     let sessionStartedAt = acState.session_started_at;
     let sleepStartedAt = acState.sleep_started_at;
 
-    // 1. ตรวจจับการตื่นนอนจากการเปิดจอ/หยิบมือถือ (is_sleeping เปลี่ยนเป็น false)
     if (updates.is_sleeping !== undefined) {
       if (!updates.is_sleeping && (acState.is_sleeping ?? false)) {
         const activeSleepStart = acState.sleep_started_at || acState.session_started_at || acState.updated_at;
         if (activeSleepStart) {
           await handleSleepSessionEnd(activeSleepStart, new Date());
         }
-        sleepStartedAt = null; // รีเซ็ตเพื่อไม่ให้บันทึกซ้ำ
+        sleepStartedAt = null;
       } else if (updates.is_sleeping && !(acState.is_sleeping ?? false)) {
         sleepStartedAt = new Date().toISOString();
       }
     }
 
-    // 2. จัดการเมื่อเปิดหรือปิดแอร์
     if (updates.power !== undefined) {
       if (updates.power && !acState.power) {
         sessionStartedAt = new Date().toISOString();
@@ -543,7 +558,6 @@ export default function App() {
           sleepStartedAt = new Date().toISOString();
         }
       } else if (!updates.power && acState.power) {
-        // บันทึกเฉพาะกรณีที่ก่อนหน้านี้ยังไม่ได้บันทึกตื่นนอน (is_sleeping ยังเป็น true)
         if (acState.is_sleeping && sleepStartedAt) {
           await handleSleepSessionEnd(sleepStartedAt, new Date());
         }
@@ -716,8 +730,8 @@ export default function App() {
         if (sessionDateStr !== sleepFilterDate) return false;
       }
       const dur = s.duration_minutes || 0;
-      if (sleepFilterType === 'long') return dur >= 360;
-      if (sleepFilterType === 'short') return dur < 360;
+      if (sleepFilterType === 'long') return dur >= 420;
+      if (sleepFilterType === 'short') return dur < 420;
       if (sleepFilterType === 'dehumidified') return (s.dry_mode_count || 0) > 0;
       return true;
     });
@@ -730,6 +744,70 @@ export default function App() {
     return filteredSleepSessions.slice(0, 7);
   }, [filteredSleepSessions, sleepFilterDate]);
 
+  // ======================= อัลกอริทึมวิเคราะห์นาฬิกาชีวภาพ & ตารางนอนแม่นยำ =======================
+  const circadianAnalysis = useMemo(() => {
+    const validSessions = sleepSessions.filter(s => s.started_at && s.ended_at && (s.duration_minutes || 0) >= 60);
+    if (validSessions.length === 0) {
+      return {
+        hasData: false,
+        avgBedtimeStr: '--:--',
+        avgWakeTimeStr: '--:--',
+        avgBedMins: 0,
+        avgDurationMins: 0,
+        recommendedSchedule: 'ยังไม่มีข้อมูลเพียงพอ',
+        bedtimeVariationMins: 0,
+      };
+    }
+
+    const minutesToTimeString = (totalMins: number) => {
+      let normalized = Math.round(totalMins) % 1440;
+      if (normalized < 0) normalized += 1440;
+      const h = Math.floor(normalized / 60);
+      const m = normalized % 60;
+      return `${h.toString().padStart(2, '0')}:${m.toString().padStart(2, '0')}`;
+    };
+
+    const bedMinutesList = validSessions.map(s => {
+      const d = new Date(s.started_at);
+      return d.getHours() * 60 + d.getMinutes();
+    });
+
+    const wakeMinutesList = validSessions.map(s => {
+      const d = new Date(s.ended_at!);
+      return d.getHours() * 60 + d.getMinutes();
+    });
+
+    const avgBedMins = getCircularAverageMinutes(bedMinutesList);
+    const avgWakeMins = getCircularAverageMinutes(wakeMinutesList);
+    const avgDurationMins = Math.round(validSessions.reduce((acc, s) => acc + (s.duration_minutes || 0), 0) / validSessions.length);
+
+    const variance = bedMinutesList.reduce((acc, val) => {
+      const diff = getCircularDiffMinutes(val, avgBedMins);
+      return acc + Math.pow(diff, 2);
+    }, 0) / bedMinutesList.length;
+    const stdDevMins = Math.round(Math.sqrt(variance));
+
+    const avgBedtimeStr = minutesToTimeString(avgBedMins);
+    const avgWakeTimeStr = minutesToTimeString(avgWakeMins);
+
+    // ปัดเวลาเริ่มนอนเฉลี่ย และตั้งเวลาตื่นที่เหมาะสมตามเกณฑ์ 8 ชม. (480 นาที)
+    const roundedBedMins = Math.round(avgBedMins / 30) * 30;
+    const roundedWakeMins = (roundedBedMins + 480) % 1440;
+
+    const recBedStr = minutesToTimeString(roundedBedMins);
+    const recWakeStr = minutesToTimeString(roundedWakeMins);
+
+    return {
+      hasData: true,
+      avgBedtimeStr,
+      avgWakeTimeStr,
+      avgBedMins,
+      avgDurationMins,
+      recommendedSchedule: `${recBedStr} - ${recWakeStr} น.`,
+      bedtimeVariationMins: stdDevMins,
+    };
+  }, [sleepSessions]);
+
   const sleepMetrics = useMemo(() => {
     const isCurrentlySleeping = acState?.power && (acState?.is_sleeping ?? false);
     const lastSession = sleepSessions[0];
@@ -740,6 +818,7 @@ export default function App() {
 
     const hasRealData = duration >= 15;
 
+    // คำนวณ Sleep Score (0 - 100) & Progress Percentage เทียบเป้าหมาย 8 ชม.
     const durRatio = Math.min(duration / SLEEP_GOAL_MINS, 1.0);
     const durScore = durRatio * 60;
     const envScore = (stats.optimalPercent / 100) * 40;
@@ -788,8 +867,6 @@ export default function App() {
       startTimeStr,
       endTimeStr,
       hasRealData,
-      lastSession,
-      recentSessions,
       past7DaysData
     };
   }, [sleepSessions, inBedDurationMins, acState, stats]);
@@ -907,7 +984,6 @@ export default function App() {
     setSleepSessions(prev => prev.filter(s => s.id !== id));
   };
 
-  // Helper สำหรับแปลงเวลา ISO เป็นฟอร์แมต YYYY-MM-DDTHH:mm สำหรับ datetime-local
   const toLocalInputValue = (isoStr?: string | null) => {
     if (!isoStr) return '';
     const d = new Date(isoStr);
@@ -1728,7 +1804,7 @@ export default function App() {
         </div>
       )}
 
-      {/* ======================= TAB 2: วัดการนอนจริงจากการใช้มือถือ ======================= */}
+      {/* ======================= TAB 2: หน้าวัดการนอน (CLEAN, COOL & OPTIMAL HIGHLIGHT) ======================= */}
       {currentTab === 'sleep' && (
         <div className="w-full max-w-md flex-1 space-y-3.5 animate-fadeIn">
           {/* Header */}
@@ -1744,7 +1820,7 @@ export default function App() {
             </span>
           </div>
 
-          {/* Card 1: Clean KPI Summary */}
+          {/* 1. HERO CARD: เวลานอนทั้งหมด, Sleep Score & หลอดความคืบหน้า (ตัดช่องอุณหภูมิ/ความชื้นออกตามที่ต้องการ ไม่รกตา) */}
           <div className="rounded-3xl bg-slate-900/90 border border-slate-800 p-4 sm:p-5 shadow-xl backdrop-blur-xl space-y-3.5">
             <div className="flex items-start justify-between gap-2">
               <div className="min-w-0">
@@ -1765,7 +1841,7 @@ export default function App() {
               </div>
             </div>
 
-            {/* Progress Bar */}
+            {/* เส้นกราฟหลอดความคืบหน้า (Progress Bar เทียบเป้าหมาย 8 ชั่วโมง) */}
             <div className="space-y-1.5 pt-0.5">
               <div className="flex justify-between items-center text-[11px] text-slate-400">
                 <span>เทียบเป้าหมาย 8 ชั่วโมง</span>
@@ -1774,35 +1850,29 @@ export default function App() {
               <div className="h-2 w-full rounded-full bg-slate-950 p-0.5 border border-slate-800 overflow-hidden">
                 <div 
                   style={{ width: `${sleepMetrics.progressPct}%` }}
-                  className="h-full rounded-full bg-indigo-500 transition-all duration-500"
+                  className="h-full rounded-full bg-indigo-500 transition-all duration-500 shadow-[0_0_10px_rgba(99,102,241,0.5)]"
                 />
               </div>
             </div>
 
-            {/* 3 Metric Pills */}
-            <div className="grid grid-cols-3 gap-2 pt-2 border-t border-slate-800/80 text-center">
-              <div className="p-2 sm:p-2.5 rounded-2xl bg-slate-950/60 border border-slate-800/60 flex flex-col justify-center">
-                <div className="text-[10px] text-slate-400 truncate">สถานะจอมือถือ</div>
-                <div className="text-xs font-bold text-slate-200 mt-0.5 truncate">
-                  {isSleeping ? 'จอดับต่อเนื่อง' : 'เปิดจอใช้งาน'}
-                </div>
+            {/* แถบระบุช่วงเวลาที่นอนไปเมื่อคืน และสถานะจอมือถือ (สะอาดตา ไม่เกะกะ) */}
+            <div className="flex items-center justify-between p-2.5 rounded-2xl bg-slate-950/70 border border-slate-800/80 text-xs">
+              <div className="flex items-center gap-1.5 text-slate-400">
+                <Clock className="h-3.5 w-3.5 text-indigo-400" />
+                <span>หลับจริงเมื่อคืน:</span>
+                <strong className="text-slate-200 font-mono">{sleepMetrics.startTimeStr} - {sleepMetrics.endTimeStr}</strong>
               </div>
-              <div className="p-2 sm:p-2.5 rounded-2xl bg-slate-950/60 border border-slate-800/60 flex flex-col justify-center">
-                <div className="text-[10px] text-slate-400 truncate">อุณหภูมิห้อง</div>
-                <div className="text-xs font-bold text-amber-300 mt-0.5">
-                  {sensor.temperature !== null ? `${sensor.temperature.toFixed(1)}°C` : '--'}
-                </div>
-              </div>
-              <div className="p-2 sm:p-2.5 rounded-2xl bg-slate-950/60 border border-slate-800/60 flex flex-col justify-center">
-                <div className="text-[10px] text-slate-400 truncate">ความชื้นเฉลี่ย</div>
-                <div className="text-xs font-bold text-cyan-300 mt-0.5">
-                  {sensor.humidity !== null ? `${sensor.humidity.toFixed(1)}%` : '--'}
-                </div>
-              </div>
+              <span className={`text-[10px] font-semibold px-2 py-0.5 rounded-full border ${
+                isSleeping 
+                  ? 'bg-indigo-500/20 text-indigo-300 border-indigo-500/40 animate-pulse'
+                  : 'bg-slate-900 text-slate-400 border-slate-800'
+              }`}>
+                {isSleeping ? 'จอดับสนิท' : 'เปิดจอใช้งาน'}
+              </span>
             </div>
           </div>
 
-          {/* Card 2: 7-Day Sleep Duration Column Chart */}
+          {/* 2. CARD: สถิติเวลานอน 7 วัน (เสากราฟสุดเท่) */}
           <div className="rounded-3xl bg-slate-900/90 border border-slate-800 p-4 sm:p-4.5 backdrop-blur-xl space-y-3">
             <div className="flex items-center justify-between gap-2">
               <div className="flex items-center gap-1.5 min-w-0">
@@ -1870,64 +1940,55 @@ export default function App() {
             </p>
           </div>
 
-          {/* Card 3: Session Details */}
-          <div className="rounded-3xl bg-slate-900/90 border border-slate-800 p-4 backdrop-blur-xl space-y-3">
+          {/* 3. CARD: นาฬิกาชีวิต & เวลาเฉลี่ยที่ควรนอนจริง (แก้บั๊ก 22:23 เป็นเที่ยงวันแล้ว) */}
+          <div className="rounded-3xl bg-gradient-to-b from-indigo-950/40 via-slate-900/90 to-slate-950 border border-indigo-500/30 p-4 sm:p-5 backdrop-blur-xl space-y-3 shadow-xl">
             <div className="flex items-center justify-between">
-              <span className="text-xs font-bold uppercase tracking-wider text-slate-200 flex items-center gap-1.5">
-                <Smartphone className="h-3.5 w-3.5 text-amber-400" />
-                <span>รายละเอียดรอบการนอนจริง</span>
-              </span>
-              <span className="text-[10px] font-mono text-slate-400">
-                {sleepMetrics.startTimeStr} - {sleepMetrics.endTimeStr}
+              <div className="flex items-center gap-1.5">
+                <Sparkle className="h-4 w-4 text-indigo-400" />
+                <span className="text-xs font-bold uppercase tracking-wider text-indigo-200">
+                  นาฬิกาชีวิต & เวลาเฉลี่ยที่ควรนอน
+                </span>
+              </div>
+              <span className={`text-[9px] px-2 py-0.5 rounded-full border font-semibold ${
+                circadianAnalysis.bedtimeVariationMins <= 45
+                  ? 'bg-emerald-500/20 text-emerald-300 border-emerald-500/40'
+                  : 'bg-amber-500/20 text-amber-300 border-amber-500/40'
+              }`}>
+                {circadianAnalysis.bedtimeVariationMins <= 45 ? 'เวลานอนนิ่งมาก' : 'เริ่มเหวี่ยงเล็กน้อย'}
               </span>
             </div>
 
+            {/* ตารางนอนที่ควรล็อกให้นิ่ง */}
+            <div className="p-3.5 rounded-2xl bg-slate-950/80 border border-indigo-500/20 text-center space-y-1">
+              <div className="text-[10px] text-slate-400 uppercase font-semibold tracking-wider">
+                ตารางนอนที่ควรล็อกให้นิ่งทุกวัน
+              </div>
+              <div className="text-3xl font-black text-transparent bg-clip-text bg-gradient-to-r from-indigo-200 via-white to-cyan-200 tracking-tight font-mono">
+                {circadianAnalysis.hasData ? circadianAnalysis.recommendedSchedule : 'กำลังคำนวณ...'}
+              </div>
+            </div>
+
+            {/* สถิติเวลาเริ่มนอน และเวลาตื่นจริงเฉลี่ย (คำนวณแบบ Circular Mean ได้ช่วงเที่ยงวันถูกต้อง) */}
             <div className="grid grid-cols-2 gap-2 text-xs">
-              <div className="p-3 rounded-2xl bg-slate-950/70 border border-slate-800/70">
-                <div className="text-[10px] text-slate-400">เวลาเริ่มหลับ (จอดับ)</div>
-                <div className="text-sm font-bold text-slate-200 mt-0.5">
-                  {sleepMetrics.startTimeStr}
-                </div>
-                <div className="text-[9px] text-slate-500 mt-0.5">Screen-Off Event</div>
+              <div className="p-2.5 rounded-2xl bg-slate-950/60 border border-slate-800/80 text-center">
+                <span className="text-[10px] text-slate-400 block mb-0.5">เริ่มนอนเฉลี่ย</span>
+                <span className="text-base font-bold text-white font-mono">{circadianAnalysis.avgBedtimeStr} น.</span>
               </div>
-
-              <div className="p-3 rounded-2xl bg-slate-950/70 border border-slate-800/70">
-                <div className="text-[10px] text-slate-400">เวลาตื่นนอน (เปิดจอ)</div>
-                <div className="text-sm font-bold text-slate-200 mt-0.5">
-                  {sleepMetrics.endTimeStr}
-                </div>
-                <div className="text-[9px] text-slate-500 mt-0.5">Screen-On Event</div>
-              </div>
-            </div>
-
-            <div className="p-3 rounded-2xl bg-slate-950/70 border border-slate-800/70 flex items-center justify-between text-xs">
-              <div>
-                <div className="text-[10px] text-slate-400">แอร์รีดน้ำระหว่างนอน</div>
-                <div className="text-sm font-bold text-cyan-300 mt-0.5">
-                  {sleepMetrics.lastSession?.dry_mode_count ?? 0} ครั้ง
-                </div>
-              </div>
-              <div className="text-right">
-                <div className="text-[10px] text-slate-400">Healthy Zone ตอนนอน</div>
-                <div className="text-sm font-bold text-emerald-400 mt-0.5">
-                  {stats.optimalPercent}%
-                </div>
+              <div className="p-2.5 rounded-2xl bg-slate-950/60 border border-slate-800/80 text-center">
+                <span className="text-[10px] text-slate-400 block mb-0.5">ตื่นนอนเฉลี่ย</span>
+                <span className="text-base font-bold text-cyan-300 font-mono">{circadianAnalysis.avgWakeTimeStr} น.</span>
               </div>
             </div>
           </div>
 
-          {/* Card 4: ประวัติการนอนย้อนหลัง พร้อมตัวกรอง */}
+          {/* 4. CARD: ประวัติการนอนย้อนหลัง พร้อมไฮไลต์สีเขียว (คืนที่นอนดีสมบูรณ์ทั้งเวลา ชม. และอุณหภูมิ) */}
           <div className="rounded-3xl bg-slate-900/90 border border-slate-800 p-4 backdrop-blur-xl space-y-3">
             <div className="flex items-center justify-between">
               <span className="text-xs font-bold uppercase tracking-wider text-slate-200 flex items-center gap-1.5">
                 <Calendar className="h-3.5 w-3.5 text-indigo-400" />
-                <span>
-                  ประวัติเซสชัน {sleepFilterDate ? `(${displayedSleepSessions.length} รายการ)` : `(7 วันล่าสุด)`}
-                </span>
+                <span>ประวัติเซสชัน {sleepFilterDate ? `(${displayedSleepSessions.length} รายการ)` : `(7 วันล่าสุด)`}</span>
               </span>
-              <span className="text-[10px] text-slate-400 font-mono">
-                ทั้งหมด {sleepSessions.length} รอบ
-              </span>
+              <span className="text-[10px] text-slate-400 font-mono">ทั้งหมด {sleepSessions.length} รอบ</span>
             </div>
 
             <div className="grid grid-cols-2 gap-2 p-2.5 rounded-2xl bg-slate-950 border border-slate-800 text-xs">
@@ -1948,8 +2009,8 @@ export default function App() {
                   className="w-full bg-slate-900 border border-slate-800 rounded-lg p-1.5 text-slate-200 text-xs focus:outline-none focus:border-cyan-500"
                 >
                   <option value="all">ทั้งหมด (All)</option>
-                  <option value="long">นอนยาว (&ge; 6 ชม.)</option>
-                  <option value="short">นอนสั้น (&lt; 6 ชม.)</option>
+                  <option value="long">นอนยาว (&ge; 7 ชม.)</option>
+                  <option value="short">นอนสั้น (&lt; 7 ชม.)</option>
                   <option value="dehumidified">คืนที่มีรีดน้ำ</option>
                 </select>
               </div>
@@ -1973,14 +2034,44 @@ export default function App() {
                 {displayedSleepSessions.map((s, idx) => {
                   const dur = s.duration_minutes || 0;
                   const pct = Math.min(100, Math.round((dur / SLEEP_GOAL_MINS) * 100));
+
+                  // เกณฑ์ประเมิน "คืนนี้นอนดีสมบูรณ์":
+                  // 1. ชม. นอนเหมาะสม (7 - 9.5 ชม. หรือ 420 - 570 นาที)
+                  const isGoodDuration = dur >= 420 && dur <= 570;
+                  // 2. เวลาเริ่มนอนตรงกรอบ (ไม่เหวี่ยงเกิน 90 นาที จากเวลาเฉลี่ย)
+                  const bedM = new Date(s.started_at).getHours() * 60 + new Date(s.started_at).getMinutes();
+                  const isConsistentBed = Math.abs(getCircularDiffMinutes(bedM, circadianAnalysis.avgBedMins)) <= 90;
+                  // 3. สภาพอากาศในห้องเหมาะสม (23.5 - 26.5°C และ 50 - 64%)
+                  const avgT = s.avg_temp ?? 25;
+                  const avgH = s.avg_humidity ?? 58;
+                  const isGoodEnv = avgT >= 23.5 && avgT <= 26.5 && avgH >= 50 && avgH <= 64;
+
+                  // สรุปว่าเป็นคืนที่ดีสมบูรณ์หรือไม่
+                  const isOptimalSleep = isGoodDuration && isConsistentBed && isGoodEnv;
+
                   return (
-                    <div key={idx} className="p-3 rounded-2xl bg-slate-950/60 border border-slate-800/80 text-xs space-y-1.5 hover:border-slate-700 transition">
+                    <div 
+                      key={idx} 
+                      className={`p-3.5 rounded-2xl border text-xs space-y-2 transition shadow-lg ${
+                        isOptimalSleep
+                          ? 'bg-gradient-to-r from-emerald-950/40 via-emerald-950/20 to-slate-950 border-emerald-500/50 shadow-[0_0_15px_rgba(16,185,129,0.12)]'
+                          : 'bg-slate-950/60 border-slate-800/80 hover:border-slate-700'
+                      }`}
+                    >
                       <div className="flex items-center justify-between text-[11px]">
-                        <span className="font-semibold text-slate-200">
-                          {new Date(s.started_at).toLocaleDateString('th-TH', { weekday: 'short', day: 'numeric', month: 'short' })}
-                        </span>
                         <div className="flex items-center gap-2">
-                          <span className="font-mono font-bold text-slate-100">
+                          <span className={`font-bold ${isOptimalSleep ? 'text-emerald-300' : 'text-slate-200'}`}>
+                            {new Date(s.started_at).toLocaleDateString('th-TH', { weekday: 'short', day: 'numeric', month: 'short' })}
+                          </span>
+                          {isOptimalSleep && (
+                            <span className="flex items-center gap-1 text-[9px] font-bold px-2 py-0.5 rounded-full bg-emerald-500/20 text-emerald-300 border border-emerald-500/40">
+                              <Sparkle className="h-2.5 w-2.5" /> นอนดีสมบูรณ์
+                            </span>
+                          )}
+                        </div>
+
+                        <div className="flex items-center gap-2">
+                          <span className={`font-mono font-black ${isOptimalSleep ? 'text-emerald-300' : 'text-slate-100'}`}>
                             {Math.floor(dur / 60)} ชม. {dur % 60} น.
                           </span>
                           <button
@@ -2003,18 +2094,25 @@ export default function App() {
                       <div className="h-1.5 w-full rounded-full bg-slate-900 overflow-hidden">
                         <div 
                           style={{ width: `${pct}%` }} 
-                          className="h-full rounded-full bg-indigo-500"
+                          className={`h-full rounded-full transition-all duration-500 ${isOptimalSleep ? 'bg-emerald-400' : 'bg-indigo-500'}`}
                         />
                       </div>
 
+                      {/* อุณหภูมิ ความชื้น และการรีดน้ำ เก็บไว้ในประวัติด้านล่าง ไม่ขึ้นไปรกข้างบน */}
                       <div className="flex items-center justify-between text-[10px] text-slate-400 pt-0.5">
                         <span>
                           {new Date(s.started_at).toLocaleTimeString('th-TH', { hour: '2-digit', minute: '2-digit' })} - {s.ended_at ? new Date(s.ended_at).toLocaleTimeString('th-TH', { hour: '2-digit', minute: '2-digit' }) : 'กำลังนอน'}
                         </span>
-                        <span>
-                          {s.avg_temp ? `${s.avg_temp.toFixed(1)}°C` : '--'} • {s.avg_humidity ? `${s.avg_humidity.toFixed(1)}%` : '--'}
-                          {(s.dry_mode_count || 0) > 0 && <span className="ml-1 text-cyan-400 font-semibold">(รีดน้ำ {s.dry_mode_count}x)</span>}
-                        </span>
+                        <div className="flex items-center gap-1.5">
+                          <span className={isOptimalSleep ? 'text-emerald-400 font-medium' : ''}>
+                            {s.avg_temp ? `${s.avg_temp.toFixed(1)}°C` : '--'} • {s.avg_humidity ? `${s.avg_humidity.toFixed(1)}%` : '--'}
+                          </span>
+                          {(s.dry_mode_count || 0) > 0 && (
+                            <span className="text-cyan-400 font-medium">
+                              (รีดน้ำ {s.dry_mode_count}x)
+                            </span>
+                          )}
+                        </div>
                       </div>
                     </div>
                   );
