@@ -239,13 +239,13 @@ export default function App() {
     try {
       const { data: ac } = await supabase.from('ac_control').select('*').eq('id', 1).single();
       if (ac && Date.now() >= manualOverrideLockUntil.current) {
-        if (!ac.is_sleeping && ac.sleep_started_at) {
-          const wakeTime = new Date(ac.updated_at || Date.now());
-          await handleSleepSessionEnd(ac.sleep_started_at, wakeTime);
-          await supabase.from('ac_control').update({ sleep_started_at: null }).eq('id', 1);
-          ac.sleep_started_at = null;
-        }
-        setAcState(ac);
+        setAcState((prev) => {
+          // ถ้าสถานะเพิ่งเปลี่ยนจากหลับเป็นตื่น ให้ดึงประวัติการนอนล่าสุดที่ Trigger เพิ่งสร้างมาแสดงทันที
+          if (prev?.is_sleeping && !ac.is_sleeping) {
+            fetchAnalyticsData(sensorFilterDate || undefined);
+          }
+          return ac;
+        });
       }
     } catch (err) {
       console.error('Fetch control error:', err);
@@ -344,14 +344,9 @@ export default function App() {
         if (Date.now() < manualOverrideLockUntil.current) return;
         if (payload.new && (payload.new as ACState).id === 1) {
           const newState = payload.new as ACState;
-          setAcState(prev => {
+          setAcState((prev) => {
             if (prev?.is_sleeping && !newState.is_sleeping) {
-              const activeSleepStart = prev.sleep_started_at || prev.session_started_at || prev.updated_at;
-              if (activeSleepStart) {
-                const wakeTime = new Date(newState.updated_at || Date.now());
-                handleSleepSessionEnd(activeSleepStart, wakeTime);
-                supabase.from('ac_control').update({ sleep_started_at: null }).eq('id', 1);
-              }
+              setTimeout(() => fetchAnalyticsData(sensorFilterDate || undefined), 800);
             }
             return newState;
           });
